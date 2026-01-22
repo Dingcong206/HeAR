@@ -37,7 +37,7 @@ else:
     # ✅ 你现在终端在 /mnt/d/Python_project/HeAR，所以数据库应在：
     DATASET_ROOT = "/mnt/d/Python_project/HeAR/ICBHI_final_database"
 
-META_CSV = os.path.join(DATASET_ROOT, "icbhi_hear_embeddings_4class_meta.csv")
+META_CSV = os.path.join(DATASET_ROOT, "./ICBHI_final_database/icbhi_hear_embeddings_4class_meta.csv")
 SPEC_DIR = os.path.join(DATASET_ROOT, "spec_npy")  # 你已经生成了 6898 个 npy
 
 # 频谱目标尺寸（HeAR/VIT 通常要求固定）
