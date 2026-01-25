@@ -56,9 +56,9 @@ RANDOM_STATE = 42
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 BATCH_SIZE = 8
-EPOCHS = 50
-LR_BACKBONE = 1e-5
-LR_HEAD = 5e-4
+EPOCHS = 10
+LR_BACKBONE = 1e-6
+LR_HEAD = 1e-4
 WEIGHT_DECAY = 1e-4
 PATIENCE = 8
 MIN_DELTA = 1e-4
@@ -221,7 +221,6 @@ class HeARHybridBinary(nn.Module):
 # 6) Eval & Utils
 # =========================
 @torch.no_grad()
-@torch.no_grad()
 def evaluate(model, loader):
     model.eval()
     ys_true, ys_pred, ys_probs = [], [], []
@@ -230,7 +229,7 @@ def evaluate(model, loader):
         xb = xb.to(DEVICE, non_blocking=True)
         logits = model(xb)
         probs = torch.sigmoid(logits)
-        preds = (probs >= 0.5).long()
+        preds = (probs >= 0.3).long()
 
         ys_true.append(yb.cpu().numpy())
         ys_pred.append(preds.cpu().numpy())
@@ -243,9 +242,9 @@ def evaluate(model, loader):
     # 计算各项指标
     acc = accuracy_score(y_true, y_pred)
     auc = roc_auc_score(y_true, y_probs)
-    f1 = f1_score(y_true, y_pred)
-    recall = recall_score(y_true, y_pred) # Recall 同 Sensitivity
-    precision = precision_score(y_true, y_pred)
+    precision = precision_score(y_true, y_pred, zero_division=0)
+    recall = recall_score(y_true, y_pred, zero_division=0)
+    f1 = f1_score(y_true, y_pred, zero_division=0)
 
     cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
     tn, fp, fn, tp = cm.ravel()
@@ -280,27 +279,50 @@ def save_confusion_matrix(cm, epoch, f1):
     plt.xlabel('Predicted')
     plt.savefig(f"best_confusion_matrix.png")
     plt.close()
+
+
+# =========================
+
+# =========================
+class FocalLoss(nn.Module):
+    def __init__(self, alpha=0.25, gamma=2.0):
+        super(FocalLoss, self).__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+
+    def forward(self, logits, targets):
+        # 确保 targets 维度与 logits 一致
+        targets = targets.view(-1)
+        logits = logits.view(-1)
+
+        bce_loss = F.binary_cross_entropy_with_logits(logits, targets, reduction='none')
+        probs = torch.sigmoid(logits)
+
+        # pt 是模型预测正确的概率
+        pt = torch.where(targets == 1, probs, 1 - probs)
+
+        # focal term 减少简单样本的权重
+        focal_term = (1 - pt) ** self.gamma
+
+        # alpha term 平衡正负样本
+        alpha_factor = torch.where(targets == 1, self.alpha, 1 - self.alpha)
+
+        loss = alpha_factor * focal_term * bce_loss
+        return loss.mean()
 # =========================
 # 7) Main
 # =========================
 def main():
+    # --- 调优参数建议 ---
+    LR_HEAD_NEW = 1e-4  # 调低 Head 学习率，防止前期震荡
+    LR_BACKBONE_NEW = 1e-6  # 极低的学习率微调 HeAR，保护预训练权重
+    # ------------------
+
     print(f"Device: {DEVICE}")
-    print(f"Checking paths...")
-    print(f"META_CSV: {os.path.abspath(META_CSV)}")
-    print(f"SPEC_DIR: {os.path.abspath(SPEC_DIR)}")
-
-    if not os.path.exists(META_CSV):
-        raise FileNotFoundError(f"找不到 meta CSV: {META_CSV}")
-    if not os.path.isdir(SPEC_DIR):
-        raise FileNotFoundError(f"找不到 SPEC_DIR: {SPEC_DIR}")
-
     meta = pd.read_csv(META_CSV)
     meta["patient_id"] = meta["wav_name"].apply(parse_patient_id)
 
-    # 自动识别标签列
     label_col = next((c for c in ["label_4class", "y", "label"] if c in meta.columns), None)
-    if label_col is None: raise ValueError("找不到标签列")
-
     y = to_binary_label(meta[label_col].to_numpy().astype(int))
     groups = meta["patient_id"].values
 
@@ -310,70 +332,77 @@ def main():
     train_ds = SpecDataset(meta.loc[train_idx, "wav_name"].values, y[train_idx])
     test_ds = SpecDataset(meta.loc[test_idx, "wav_name"].values, y[test_idx])
 
-    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True)
-    test_loader = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False)
+    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=4, pin_memory=True)
+    test_loader = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=4, pin_memory=True)
 
     config = AutoConfig.from_pretrained("google/hear-pytorch")
     base = AutoModel.from_pretrained("google/hear-pytorch", config=config, ignore_mismatched_sizes=True)
     model = HeARHybridBinary(base, pattern=HYBRID_PATTERN).to(DEVICE)
 
+    # 初始状态：冻结 HeAR
     set_requires_grad(model.hear, False)
 
-    # 简单计算 pos_weight
-    n_pos = y[train_idx].sum()
-    pos_weight = torch.tensor([(len(train_idx) - n_pos) / max(n_pos, 1)]).to(DEVICE)
+    # 使用 Focal Loss 替代原来的 BCEWithLogitsLoss
+    criterion = FocalLoss(alpha=0.25, gamma=2.0).to(DEVICE)
 
     optimizer = torch.optim.AdamW([
-        {"params": [p for n, p in model.named_parameters() if not n.startswith("hear.")], "lr": LR_HEAD}
+        {"params": [p for n, p in model.named_parameters() if not n.startswith("hear.")], "lr": LR_HEAD_NEW}
     ], weight_decay=WEIGHT_DECAY)
 
-    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+    # 引入余弦退火调度器，让学习过程更平滑
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
+
     best_f1 = -1.0
-    print(f"{'Epoch':<8} | {'Acc':<8} | {'AUC':<8} | {'F1':<8} |{'Precision':<8} | {'Sens':<8} | {'Spec':<8}")
-    print("-" * 100)
+    print(f"{'Epoch':<8} | {'Acc':<8} | {'AUC':<8} | {'F1':<8} | {'Sens':<8} | {'Spec':<8}")
+    print("-" * 80)
 
     for epoch in range(1, EPOCHS + 1):
-        # --- 训练逻辑 ---
+        # 第 FREEZE_EPOCHS + 1 轮解冻 Backbone
         if epoch == FREEZE_EPOCHS + 1:
+            print(f"\n>>> Unfreezing HeAR backbone with LR: {LR_BACKBONE_NEW}")
             set_requires_grad(model.hear, True)
-            optimizer.add_param_group({"params": model.hear.parameters(), "lr": LR_BACKBONE})
+            optimizer.add_param_group({"params": model.hear.parameters(), "lr": LR_BACKBONE_NEW})
 
         model.train()
+        total_loss = 0
         for xb, yb in train_loader:
-            xb, yb = xb.to(DEVICE), yb.to(DEVICE)
-            optimizer.zero_grad()
-            loss = criterion(model(xb), yb)
-            loss.backward()
-            optimizer.step()
+            xb, yb = xb.to(DEVICE), yb.to(DEVICE).float()
 
-        # --- 评估逻辑 ---
-        m, y_true, y_pred = evaluate(model, test_loader)
+            optimizer.zero_grad()
+            logits = model(xb)
+            loss = criterion(logits, yb)
+            loss.backward()
+
+            # --- 新增：梯度裁剪，防止像第26轮那样的崩盘 ---
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+            optimizer.step()
+            total_loss += loss.item()
+
+        scheduler.step()  # 更新学习率
+
+        # --- 评估 ---
+        m, _, _ = evaluate(model, test_loader)
 
         # 实时打印主要指标
         print(
-            f"{epoch:<8} | {m['Accuracy']:.4f} | {m['AUC']:.4f} | {m['F1']:.4f} | {m['Precision']:.4f} |{m['Sensitivity']:.4f} | {m['Specificity']:.4f}")
+            f"{epoch:<8} | {m['Accuracy']:.4f} | {m['AUC']:.4f} | {m['F1']:.4f} | {m['Sensitivity']:.4f} | {m['Specificity']:.4f}")
 
-        # 保存表现最好的模型和对应的详细数据
+        # 以 F1 分数为核心保存指标
         if m['F1'] > best_f1:
             best_f1 = m['F1']
             torch.save(model.state_dict(), "best_model.pt")
-
-            # 保存混淆矩阵图片
             save_confusion_matrix(m['CM'], epoch, m['F1'])
-
-            # 记录当前最优的一组数值，方便最后查看
             best_metrics_summary = m
 
+    # 训练结束打印总结
     print("\n" + "=" * 30)
-    print("Training Finished!")
-    print(f"Best F1 Score: {best_f1:.4f}")
-    print("Best Metrics Summary:")
+    print("Final Report (Best F1 Model):")
     for k, v in best_metrics_summary.items():
-        if k != "CM":
-            print(f" - {k}: {v:.4f}")
-    print("Confusion Matrix:")
-    print(best_metrics_summary["CM"])
+        if k != "CM": print(f" - {k}: {v:.4f}")
+    print("Confusion Matrix:\n", best_metrics_summary["CM"])
     print("=" * 30)
+
 
 if __name__ == "__main__":
     main()
