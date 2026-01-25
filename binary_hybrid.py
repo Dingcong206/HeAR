@@ -148,36 +148,58 @@ def evaluate(model, loader):
 # 5) 主训练循环 (修复 Scheduler 和 Accumulation)
 # =========================
 def main():
-    print(f"Device: {DEVICE} | Using Mamba Hybrid Pattern: {HYBRID_PATTERN}")
-    meta = pd.read_csv(META_CSV)
-    y = (meta["label_4class"].to_numpy() != 0).astype(int)
-    groups = meta["wav_name"].apply(
-        lambda x: int(re.match(r"^(\d+)_", x).group(1)) if re.match(r"^(\d+)_", x) else 0).values
+        print(f"Device: {DEVICE} | Using Mamba Hybrid Pattern: {HYBRID_PATTERN}")
+        meta = pd.read_csv(META_CSV)
+        y = (meta["label_4class"].to_numpy() != 0).astype(int)
+        groups = meta["wav_name"].apply(
+            lambda x: int(re.match(r"^(\d+)_", x).group(1)) if re.match(r"^(\d+)_", x) else 0).values
 
-    split = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=42)
-    train_idx, test_idx = next(split.split(meta["wav_name"], y, groups=groups))
+        split = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=42)
+        train_idx, test_idx = next(split.split(meta["wav_name"], y, groups=groups))
 
-    train_loader = DataLoader(SpecDataset(meta.loc[train_idx, "wav_name"], y[train_idx]),
-                              batch_size=BATCH_SIZE, shuffle=True, num_workers=4)
-    test_loader = DataLoader(SpecDataset(meta.loc[test_idx, "wav_name"], y[test_idx]),
-                             batch_size=BATCH_SIZE, shuffle=False)
+        train_loader = DataLoader(SpecDataset(meta.loc[train_idx, "wav_name"], y[train_idx]),
+                                  batch_size=BATCH_SIZE, shuffle=True, num_workers=4)
+        test_loader = DataLoader(SpecDataset(meta.loc[test_idx, "wav_name"], y[test_idx]),
+                                 batch_size=BATCH_SIZE, shuffle=False)
 
-    base = AutoModel.from_pretrained("google/hear-pytorch", trust_remote_code=True)
-    model = HeARHybridBinary(base, pattern=HYBRID_PATTERN).to(DEVICE)
+        base = AutoModel.from_pretrained("google/hear-pytorch", trust_remote_code=True)
+        model = HeARHybridBinary(base, pattern=HYBRID_PATTERN).to(DEVICE)
 
-    for p in model.hear.parameters(): p.requires_grad = False
+        # 1. 初始状态：冻结 Backbone
+        for p in model.hear.parameters():
+            p.requires_grad = False
 
-    criterion = FocalLoss(alpha=0.4, gamma=2.0)
-    optimizer = torch.optim.AdamW(
-        [{"params": [p for n, p in model.named_parameters() if "hear" not in n], "lr": LR_HEAD}], weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
+        criterion = FocalLoss(alpha=0.4, gamma=2.0)
 
-    best_auc = -1.0
-    print(f"{'Epoch':<6} | {'AUC':<8} | {'Sens':<8} | {'Spec':<8}")
+        # 2. 初始优化器：只包含 Head 和 Hybrid 的参数
+        optimizer = torch.optim.AdamW(
+            [{"params": [p for n, p in model.named_parameters() if "hear" not in n], "lr": LR_HEAD}],
+            weight_decay=1e-4
+        )
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
 
-    if epoch == FREEZE_EPOCHS + 1:
-        print(f"\n>>> Strategic Unfreezing: Increasing Drive...")
-        for p in model.hear.parameters(): p.requires_grad = True
+        best_auc = -1.0
+        print(f"{'Epoch':<6} | {'AUC':<8} | {'Sens':<8} | {'Spec':<8}")
+
+        # ================= 开始训练循环 =================
+        for epoch in range(1, EPOCHS + 1):
+
+            # 【修正点：此判断必须在 for 循环内】
+            if epoch == FREEZE_EPOCHS + 1:
+                print(f"\n>>> Strategic Unfreezing: Increasing Drive (Backbone LR=5e-6)...")
+                # 物理上开启梯度
+                for p in model.hear.parameters():
+                    p.requires_grad = True
+
+                # 【核心修正：必须重新定义优化器，否则解冻无效】
+                optimizer = torch.optim.AdamW([
+                    {"params": model.hear.parameters(), "lr": 5e-6},  # Backbone 极低学习率
+                    {"params": model.hybrid.parameters(), "lr": 1e-4},  # Hybrid 中等学习率
+                    {"params": model.head.parameters(), "lr": 1e-4}  # Head 中等学习率
+                ], weight_decay=1e-3)  # 适当增加权重衰减
+
+                # 重新关联调度器
+                scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS - FREEZE_EPOCHS)
 
         # 大幅提升微调力度
         optimizer = torch.optim.AdamW([
