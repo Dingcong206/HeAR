@@ -329,7 +329,7 @@ def main():
 
     criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
     best_f1 = -1.0
-    print(f"{'Epoch':<8} | {'Acc':<8} | {'AUC':<8} | {'F1':<8} |{m['Precision']:.4f} | {'Sens':<8} | {'Spec':<8}")
+    print(f"{'Epoch':<8} | {'Acc':<8} | {'AUC':<8} | {'F1':<8} |{['Precision']:.4f} | {'Sens':<8} | {'Spec':<8}")
     print("-" * 60)
 
     for epoch in range(1, EPOCHS + 1):
