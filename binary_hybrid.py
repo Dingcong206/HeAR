@@ -30,7 +30,7 @@ BATCH_SIZE = 8
 ACCUMULATION_STEPS = 4
 EPOCHS = 30
 LR_HEAD = 1e-4
-FREEZE_EPOCHS = 5
+FREEZE_EPOCHS = 10  # 增加冻结轮数，先让 Head 稳住
 HYBRID_PATTERN = "TMT"
 
 
@@ -59,7 +59,7 @@ class SpecDataset(Dataset):
 
 
 # =========================
-# 3) 模型架构 (Mamba 混合动力)
+# 3) 模型架构
 # =========================
 class TransformerBlock(nn.Module):
     def __init__(self, d_model, nhead=8, dropout=0.1):
@@ -108,10 +108,10 @@ class HeARHybridBinary(nn.Module):
 
 
 # =========================
-# 4) 损失函数与评估 (修复逻辑)
+# 4) 损失函数与评估
 # =========================
 class FocalLoss(nn.Module):
-    def __init__(self, alpha=0.4, gamma=2.0):
+    def __init__(self, alpha=0.6, gamma=2.0):  # alpha=0.6 引导模型多关注正类(1)
         super().__init__()
         self.alpha, self.gamma = alpha, gamma
 
@@ -128,88 +128,57 @@ def evaluate(model, loader):
     ys, probs = [], []
     for xb, yb in loader:
         p = torch.sigmoid(model(xb.to(DEVICE)))
-        ys.append(yb.numpy())
+        ys.append(yb.numpy());
         probs.append(p.cpu().numpy())
     y_true, y_prob = np.concatenate(ys), np.concatenate(probs)
     y_pred = (y_prob >= 0.5).astype(int)
     auc = roc_auc_score(y_true, y_prob)
     cm = confusion_matrix(y_true, y_pred)
     tn, fp, fn, tp = cm.ravel()
-    # 返回扁平化的字典，避免解包错误
-    return {
-        "AUC": auc,
-        "Sens": tp / (tp + fn + 1e-8),
-        "Spec": tn / (tn + fp + 1e-8),
-        "CM": cm
-    }
+    return {"AUC": auc, "Sens": tp / (tp + fn + 1e-8), "Spec": tn / (tn + fp + 1e-8), "CM": cm}
 
 
 # =========================
-# 5) 主训练循环 (修复 Scheduler 和 Accumulation)
+# 5) 训练逻辑
 # =========================
 def main():
-        print(f"Device: {DEVICE} | Using Mamba Hybrid Pattern: {HYBRID_PATTERN}")
-        meta = pd.read_csv(META_CSV)
-        y = (meta["label_4class"].to_numpy() != 0).astype(int)
-        groups = meta["wav_name"].apply(
-            lambda x: int(re.match(r"^(\d+)_", x).group(1)) if re.match(r"^(\d+)_", x) else 0).values
+    print(f"Device: {DEVICE} | Using Pattern: {HYBRID_PATTERN}")
+    meta = pd.read_csv(META_CSV)
+    y = (meta["label_4class"].to_numpy() != 0).astype(int)
+    groups = meta["wav_name"].apply(
+        lambda x: int(re.match(r"^(\d+)_", x).group(1)) if re.match(r"^(\d+)_", x) else 0).values
 
-        split = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=42)
-        train_idx, test_idx = next(split.split(meta["wav_name"], y, groups=groups))
+    split = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=42)
+    train_idx, test_idx = next(split.split(meta["wav_name"], y, groups=groups))
 
-        train_loader = DataLoader(SpecDataset(meta.loc[train_idx, "wav_name"], y[train_idx]),
-                                  batch_size=BATCH_SIZE, shuffle=True, num_workers=4)
-        test_loader = DataLoader(SpecDataset(meta.loc[test_idx, "wav_name"], y[test_idx]),
-                                 batch_size=BATCH_SIZE, shuffle=False)
+    train_loader = DataLoader(SpecDataset(meta.loc[train_idx, "wav_name"], y[train_idx]),
+                              batch_size=BATCH_SIZE, shuffle=True, num_workers=4)
+    test_loader = DataLoader(SpecDataset(meta.loc[test_idx, "wav_name"], y[test_idx]),
+                             batch_size=BATCH_SIZE, shuffle=False)
 
-        base = AutoModel.from_pretrained("google/hear-pytorch", trust_remote_code=True)
-        model = HeARHybridBinary(base, pattern=HYBRID_PATTERN).to(DEVICE)
+    base = AutoModel.from_pretrained("google/hear-pytorch", trust_remote_code=True)
+    model = HeARHybridBinary(base, pattern=HYBRID_PATTERN).to(DEVICE)
 
-        # 1. 初始状态：冻结 Backbone
-        for p in model.hear.parameters():
-            p.requires_grad = False
+    for p in model.hear.parameters(): p.requires_grad = False
 
-        criterion = FocalLoss(alpha=0.4, gamma=2.0)
+    criterion = FocalLoss(alpha=0.6, gamma=2.0)
+    optimizer = torch.optim.AdamW(
+        [{"params": [p for n, p in model.named_parameters() if "hear" not in n], "lr": LR_HEAD}], weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
 
-        # 2. 初始优化器：只包含 Head 和 Hybrid 的参数
-        optimizer = torch.optim.AdamW(
-            [{"params": [p for n, p in model.named_parameters() if "hear" not in n], "lr": LR_HEAD}],
-            weight_decay=1e-4
-        )
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
+    best_auc = -1.0
+    print(f"{'Epoch':<6} | {'AUC':<8} | {'Sens':<8} | {'Spec':<8}")
 
-        best_auc = -1.0
-        print(f"{'Epoch':<6} | {'AUC':<8} | {'Sens':<8} | {'Spec':<8}")
-
-        # ================= 开始训练循环 =================
-        for epoch in range(1, EPOCHS + 1):
-
-            # 【修正点：此判断必须在 for 循环内】
-            if epoch == FREEZE_EPOCHS + 1:
-                print(f"\n>>> Strategic Unfreezing: Increasing Drive (Backbone LR=5e-6)...")
-                # 物理上开启梯度
-                for p in model.hear.parameters():
-                    p.requires_grad = True
-
-                # 【核心修正：必须重新定义优化器，否则解冻无效】
-                optimizer = torch.optim.AdamW([
-                    {"params": model.hear.parameters(), "lr": 5e-6},  # Backbone 极低学习率
-                    {"params": model.hybrid.parameters(), "lr": 1e-4},  # Hybrid 中等学习率
-                    {"params": model.head.parameters(), "lr": 1e-4}  # Head 中等学习率
-                ], weight_decay=1e-3)  # 适当增加权重衰减
-
-                # 重新关联调度器
-                scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS - FREEZE_EPOCHS)
-
-        # 大幅提升微调力度
-        optimizer = torch.optim.AdamW([
-            {"params": model.hear.parameters(), "lr": 5e-6},  # 提升一个数量级
-            {"params": model.hybrid.parameters(), "lr": 1e-4},  # Hybrid 需要更强主导力
-            {"params": model.head.parameters(), "lr": 1e-4}
-        ], weight_decay=1e-3)  # 增加权重衰减防止过拟合
-
-        # 缩短调度周期，让模型在解冻后期快速收敛
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=10)
+    for epoch in range(1, EPOCHS + 1):
+        if epoch == FREEZE_EPOCHS + 1:
+            print(f"\n>>> Strategic Unfreezing (Backbone LR=2e-6)")
+            for p in model.hear.parameters(): p.requires_grad = True
+            optimizer = torch.optim.AdamW([
+                {"params": model.hear.parameters(), "lr": 2e-6},  # 使用更保守的解冻 LR
+                {"params": model.hybrid.parameters(), "lr": 5e-5},
+                {"params": model.head.parameters(), "lr": 5e-5}
+            ], weight_decay=1e-2)
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS - FREEZE_EPOCHS)
 
         model.train()
         optimizer.zero_grad()
@@ -225,17 +194,14 @@ def main():
                 optimizer.step()
                 optimizer.zero_grad()
 
-        # 严格遵守 step 顺序
         scheduler.step()
-
-        # 修正 KeyError 的调用方式
         res = evaluate(model, test_loader)
         print(f"{epoch:<6} | {res['AUC']:.4f} | {res['Sens']:.4f} | {res['Spec']:.4f}")
 
         if res['AUC'] > best_auc:
             best_auc = res['AUC']
-            torch.save(model.state_dict(), "best_hybrid_v2.pt")
-            print(f"  [Best AUC Updated] CM:\n{res['CM']}")
+            torch.save(model.state_dict(), "best_hybrid_final.pt")
+            print(f"  [New Best AUC] CM:\n{res['CM']}")
 
 
 if __name__ == "__main__":
