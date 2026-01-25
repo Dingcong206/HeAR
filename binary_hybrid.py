@@ -93,7 +93,13 @@ class HeARHybridBinary(nn.Module):
         for ch in pattern:
             blocks.append(TransformerBlock(d_model) if ch == "T" else BiMambaBlock(d_model))
         self.hybrid = nn.Sequential(*blocks)
-        self.head = nn.Linear(d_model, 1)
+        self.head = nn.Sequential(
+            nn.Linear(d_model, 256),
+            nn.LayerNorm(256),
+            nn.GELU(),
+            nn.Dropout(0.3),
+            nn.Linear(256, 1)
+        )
 
     def forward(self, spec):
         x = self.hear(pixel_values=spec).last_hidden_state
@@ -169,17 +175,19 @@ def main():
     best_auc = -1.0
     print(f"{'Epoch':<6} | {'AUC':<8} | {'Sens':<8} | {'Spec':<8}")
 
-    for epoch in range(1, EPOCHS + 1):
-        if epoch == FREEZE_EPOCHS + 1:
-            print(f"\n>>> Unfreezing Backbone...")
-            for p in model.hear.parameters(): p.requires_grad = True
-            optimizer = torch.optim.AdamW([
-                {"params": model.hear.parameters(), "lr": 5e-7},
-                {"params": model.hybrid.parameters(), "lr": 5e-5},
-                {"params": model.head.parameters(), "lr": 2e-5}
-            ], weight_decay=1e-4)
-            # 重置调度器
-            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS - FREEZE_EPOCHS)
+    if epoch == FREEZE_EPOCHS + 1:
+        print(f"\n>>> Strategic Unfreezing: Increasing Drive...")
+        for p in model.hear.parameters(): p.requires_grad = True
+
+        # 大幅提升微调力度
+        optimizer = torch.optim.AdamW([
+            {"params": model.hear.parameters(), "lr": 5e-6},  # 提升一个数量级
+            {"params": model.hybrid.parameters(), "lr": 1e-4},  # Hybrid 需要更强主导力
+            {"params": model.head.parameters(), "lr": 1e-4}
+        ], weight_decay=1e-3)  # 增加权重衰减防止过拟合
+
+        # 缩短调度周期，让模型在解冻后期快速收敛
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=10)
 
         model.train()
         optimizer.zero_grad()
