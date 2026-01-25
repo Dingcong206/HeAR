@@ -343,7 +343,7 @@ def main():
     set_requires_grad(model.hear, False)
 
     # 使用 Focal Loss 替代原来的 BCEWithLogitsLoss
-    criterion = FocalLoss(alpha=0.25, gamma=2.0).to(DEVICE)
+    criterion = FocalLoss(alpha=0.75, gamma=2.0).to(DEVICE)
 
     optimizer = torch.optim.AdamW([
         {"params": [p for n, p in model.named_parameters() if not n.startswith("hear.")], "lr": LR_HEAD_NEW}
