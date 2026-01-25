@@ -57,7 +57,8 @@ def main():
     print(f"Using Device: {DEVICE}")
 
     # --- 加载提取好的 3D 特征 ---
-    data = np.load("icbhi_sequence_embeddings_3D.npz")
+    data = np.load("/data/dingcong/HeAR/ICBHI_final_database/icbhi_sequence_embeddings_3D.npz")
+
     X = data["X"]  # (6898, 97, 1024)
     y = (data["y"] != 0).astype(int)  # 转换为二分类：健康 vs 异常
 
