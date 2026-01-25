@@ -10,13 +10,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
-
 from sklearn.model_selection import GroupShuffleSplit
+from sklearn.metrics import (
+    accuracy_score,
+    roc_auc_score,
+    recall_score,
+    precision_score
+)
 
-from sklearn.metrics import roc_auc_score, recall_score, precision_score
-from transformers import AutoModel, AutoConfig
-
-warnings.filterwarnings("ignore")
 
 # -------------------------
 # 0) 依赖：mamba-ssm
