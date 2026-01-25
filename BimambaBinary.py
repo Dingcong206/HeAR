@@ -310,6 +310,25 @@ class FocalLoss(nn.Module):
         loss = alpha_factor * focal_term * bce_loss
         return loss.mean()
 # =========================
+
+def check_data_quality(train_loader):
+    print("\n--- Data Quality Check ---")
+    for xb, yb in train_loader:
+        # 检查标签分布
+        pos_count = torch.sum(yb).item()
+        neg_count = len(yb) - pos_count
+        print(f"Batch Label Distribution -> Positive: {pos_count}, Negative: {neg_count}")
+
+        # 检查频谱特征数值范围
+        # 如果 mean 近似 0 且 std 非常小，说明归一化过度，特征丢失了
+        print(f"Spec Shape: {xb.shape}")
+        print(f"Spec Value Range: Min={xb.min():.4f}, Max={xb.max():.4f}, Mean={xb.mean():.4f}, Std={xb.std():.4f}")
+
+        # 检查是否存在 NaN 或 Inf
+        if torch.isnan(xb).any():
+            print("WARNING: Data contains NaN!")
+        break  # 只查第一个 batch 即可
+# =========================
 # 7) Main
 # =========================
 def main():
@@ -338,16 +357,16 @@ def main():
     config = AutoConfig.from_pretrained("google/hear-pytorch")
     base = AutoModel.from_pretrained("google/hear-pytorch", config=config, ignore_mismatched_sizes=True)
     model = HeARHybridBinary(base, pattern=HYBRID_PATTERN).to(DEVICE)
-
+    print(f"Total Labels Count: {np.bincount(y)}")
     # 初始状态：冻结 HeAR
     set_requires_grad(model.hear, False)
-
+    check_data_quality(train_loader)
     # 使用 Focal Loss 替代原来的 BCEWithLogitsLoss
-    criterion = FocalLoss(alpha=0.75, gamma=2.0).to(DEVICE)
+    criterion = FocalLoss(alpha=0.75, gamma=3.0).to(DEVICE)
 
     optimizer = torch.optim.AdamW([
-        {"params": [p for n, p in model.named_parameters() if not n.startswith("hear.")], "lr": LR_HEAD_NEW}
-    ], weight_decay=WEIGHT_DECAY)
+        {"params": [p for n, p in model.named_parameters() if not n.startswith("hear.")], "lr": 5e-5}
+    ], weight_decay=1e-4)
 
     # 引入余弦退火调度器，让学习过程更平滑
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
