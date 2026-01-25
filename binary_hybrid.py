@@ -37,7 +37,7 @@ LR_HEAD = 1e-4  # Head 初始学习率
 LR_BACKBONE = 5e-7  # 解冻后 Backbone 使用极低学习率
 FREEZE_EPOCHS = 5  # 前5轮只练 Head/Hybrid
 
-HYBRID_PATTERN = "TMTMT"
+HYBRID_PATTERN = "TMT"
 NHEAD, D_STATE, D_CONV, DROPOUT = 8, 16, 4, 0.1
 
 
@@ -179,21 +179,37 @@ def main():
 
     best_auc = -1.0
     print(f"{'Epoch':<6} | {'AUC':<8} | {'Sens':<8} | {'Spec':<8}")
+    ACCUMULATION_STEPS = 4  # 模拟 Batch Size = 8 * 4 = 32
+    optimizer = torch.optim.AdamW([
+        {"params": [p for n, p in model.named_parameters() if "hear" not in n], "lr": 1e-4}
+    ], weight_decay=1e-4)
 
+    # ... (训练循环中) ...
     for epoch in range(1, EPOCHS + 1):
         if epoch == FREEZE_EPOCHS + 1:
-            print(f"\n>>> Unfreezing HeAR Backbone (LR={LR_BACKBONE})")
+            print(f"\n>>> Unfreezing Backbone with Balanced LR")
             for p in model.hear.parameters(): p.requires_grad = True
-            optimizer.add_param_group({"params": model.hear.parameters(), "lr": LR_BACKBONE})
+            # 给 Backbone 稍微加一点点力，给 Head 稳住
+            optimizer = torch.optim.AdamW([
+                {"params": model.hear.parameters(), "lr": 8e-7},
+                {"params": model.hybrid.parameters(), "lr": 1e-4},
+                {"params": model.head.parameters(), "lr": 5e-5}
+            ], weight_decay=1e-4)
 
         model.train()
-        for xb, yb in train_loader:
+        optimizer.zero_grad()  # 放在循环外
+
+        for i, (xb, yb) in enumerate(train_loader):
             xb, yb = xb.to(DEVICE), yb.to(DEVICE)
-            optimizer.zero_grad()
-            loss = criterion(model(xb), yb)
+
+            logits = model(xb)
+            loss = criterion(logits, yb) / ACCUMULATION_STEPS  # 梯度平均
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
+
+            if (i + 1) % ACCUMULATION_STEPS == 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)  # 裁剪
+                optimizer.step()
+                optimizer.zero_grad()
 
         scheduler.step()
         res, yt, yp = evaluate(model, test_loader)
