@@ -1,6 +1,6 @@
 import os
 import re
-import warnings
+import random
 import numpy as np
 import pandas as pd
 import torch
@@ -38,23 +38,43 @@ HYBRID_PATTERN = "TMT"
 # 2) 数据处理
 # =========================
 class SpecDataset(Dataset):
-    def __init__(self, wav_names, y_bin):
+    def __init__(self, wav_names, y_bin, augment=False):
         self.wav_names = list(wav_names)
         self.y = torch.from_numpy(np.asarray(y_bin)).float()
+        self.augment = augment
 
     def __len__(self):
         return len(self.wav_names)
+
+    def _apply_spec_augment(self, x):
+        # x shape: [1, H, W] -> [1, 192, 128]
+        ch, h, w = x.shape
+        # Frequency masking
+        f = random.randint(0, 15)
+        f0 = random.randint(0, h - f)
+        x[:, f0:f0 + f, :] = 0
+        # Time masking
+        t = random.randint(0, 10)
+        t0 = random.randint(0, w - t)
+        x[:, :, t0:t0 + t] = 0
+        return x
 
     def __getitem__(self, idx):
         path = os.path.join(SPEC_DIR, os.path.splitext(self.wav_names[idx])[0] + ".npy")
         arr = np.load(path)
         if arr.ndim == 2:
             arr = arr[None, ...]
-        elif arr.ndim == 3 and arr.shape[-1] == 1:
+        elif arr.ndim == 3:
             arr = np.transpose(arr, (2, 0, 1))
+
         x = torch.from_numpy(arr[:1, ...]).float()
         x = (x - x.mean()) / (x.std() + 1e-6)
         x = F.interpolate(x.unsqueeze(0), size=TARGET_HW, mode="bilinear", align_corners=False).squeeze(0)
+
+        # 仅在训练集开启增强
+        if self.augment and random.random() > 0.5:
+            x = self._apply_spec_augment(x)
+
         return x, self.y[idx]
 
 
@@ -142,7 +162,7 @@ def evaluate(model, loader):
 # 5) 训练逻辑
 # =========================
 def main():
-    print(f"Device: {DEVICE} | Using Pattern: {HYBRID_PATTERN}")
+    print(f"Device: {DEVICE} | FINAL ATTEMPT WITH SPECAUGMENT")
     meta = pd.read_csv(META_CSV)
     y = (meta["label_4class"].to_numpy() != 0).astype(int)
     groups = meta["wav_name"].apply(
@@ -151,9 +171,10 @@ def main():
     split = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=42)
     train_idx, test_idx = next(split.split(meta["wav_name"], y, groups=groups))
 
-    train_loader = DataLoader(SpecDataset(meta.loc[train_idx, "wav_name"], y[train_idx]),
+    # 训练集开启 augment=True
+    train_loader = DataLoader(SpecDataset(meta.loc[train_idx, "wav_name"], y[train_idx], augment=True),
                               batch_size=BATCH_SIZE, shuffle=True, num_workers=4)
-    test_loader = DataLoader(SpecDataset(meta.loc[test_idx, "wav_name"], y[test_idx]),
+    test_loader = DataLoader(SpecDataset(meta.loc[test_idx, "wav_name"], y[test_idx], augment=False),
                              batch_size=BATCH_SIZE, shuffle=False)
 
     base = AutoModel.from_pretrained("google/hear-pytorch", trust_remote_code=True)
@@ -161,9 +182,10 @@ def main():
 
     for p in model.hear.parameters(): p.requires_grad = False
 
-    criterion = FocalLoss(alpha=0.6, gamma=2.0)
-    optimizer = torch.optim.AdamW(
-        [{"params": [p for n, p in model.named_parameters() if "hear" not in n], "lr": LR_HEAD}], weight_decay=1e-4)
+    # 使用带标签平滑的二分类损失
+    criterion = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([1.2]).to(DEVICE))  # 稍微补偿正类权重
+    optimizer = torch.optim.AdamW([{"params": [p for n, p in model.named_parameters() if "hear" not in n], "lr": 1e-4}],
+                                  weight_decay=5e-3)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
 
     best_auc = -1.0
@@ -171,26 +193,31 @@ def main():
 
     for epoch in range(1, EPOCHS + 1):
         if epoch == FREEZE_EPOCHS + 1:
-            print(f"\n>>> Strategic Unfreezing (Backbone LR=2e-6)")
+            print(f"\n>>> Final Strategic Unfreezing (LR=1e-6 + Mix-layer LR)")
             for p in model.hear.parameters(): p.requires_grad = True
             optimizer = torch.optim.AdamW([
-                {"params": model.hear.parameters(), "lr": 2e-6},  # 使用更保守的解冻 LR
-                {"params": model.hybrid.parameters(), "lr": 5e-5},
-                {"params": model.head.parameters(), "lr": 5e-5}
+                {"params": model.hear.parameters(), "lr": 1e-6},  # 极小步长保护特征
+                {"params": model.hybrid.parameters(), "lr": 2e-5},
+                {"params": model.head.parameters(), "lr": 2e-5}
             ], weight_decay=1e-2)
             scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS - FREEZE_EPOCHS)
 
         model.train()
+        total_loss = 0
         optimizer.zero_grad()
 
         for i, (xb, yb) in enumerate(train_loader):
             xb, yb = xb.to(DEVICE), yb.to(DEVICE)
+
+            # Label Smoothing: 0->0.05, 1->0.95
+            yb_smooth = yb * 0.9 + 0.05
+
             logits = model(xb)
-            loss = criterion(logits, yb) / ACCUMULATION_STEPS
+            loss = criterion(logits, yb_smooth) / ACCUMULATION_STEPS
             loss.backward()
 
-            if (i + 1) % ACCUMULATION_STEPS == 0 or (i + 1) == len(train_loader):
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            if (i + 1) % ACCUMULATION_STEPS == 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)  # 更严格的裁剪
                 optimizer.step()
                 optimizer.zero_grad()
 
@@ -200,8 +227,8 @@ def main():
 
         if res['AUC'] > best_auc:
             best_auc = res['AUC']
-            torch.save(model.state_dict(), "best_hybrid_final.pt")
-            print(f"  [New Best AUC] CM:\n{res['CM']}")
+            torch.save(model.state_dict(), "final_best_model.pt")
+            print(f"  [Critical Update] CM:\n{res['CM']}")
 
 
 if __name__ == "__main__":
