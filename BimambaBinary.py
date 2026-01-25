@@ -11,12 +11,16 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from sklearn.model_selection import GroupShuffleSplit
+from transformers import AutoConfig, AutoModel
 from sklearn.metrics import (
     accuracy_score,
     roc_auc_score,
     recall_score,
-    precision_score
+    precision_score,
+    f1_score,
+    confusion_matrix
 )
+
 
 
 # -------------------------
@@ -240,7 +244,8 @@ def evaluate(model, loader):
     acc = accuracy_score(y_true, y_pred)
     auc = roc_auc_score(y_true, y_probs)
     f1 = f1_score(y_true, y_pred)
-    recall = recall_score(y_true, y_pred)  # Recall 同 Sensitivity
+    recall = recall_score(y_true, y_pred) # Recall 同 Sensitivity
+    precision = precision_score(y_true, y_pred)
 
     cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
     tn, fp, fn, tp = cm.ravel()
@@ -252,6 +257,7 @@ def evaluate(model, loader):
         "Accuracy": acc,
         "AUC": auc,
         "F1": f1,
+        "Precision": precision,
         "Recall": recall,
         "Sensitivity": sensitivity,
         "Specificity": specificity,
@@ -345,7 +351,7 @@ def main():
 
         # 实时打印主要指标
         print(
-            f"{epoch:<8} | {m['Accuracy']:.4f} | {m['AUC']:.4f} | {m['F1']:.4f} | {m['Sensitivity']:.4f} | {m['Specificity']:.4f}")
+            f"{epoch:<8} | {m['Accuracy']:.4f} | {m['AUC']:.4f} | {m['F1']:.4f} | {m['Precision']:.4f} |{m['Sensitivity']:.4f} | {m['Specificity']:.4f}")
 
         # 保存表现最好的模型和对应的详细数据
         if m['F1'] > best_f1:
