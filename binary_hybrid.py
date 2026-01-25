@@ -1,7 +1,6 @@
 import os
 import re
 import warnings
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import torch
@@ -9,7 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from sklearn.model_selection import GroupShuffleSplit
-from transformers import AutoConfig, AutoModel
+from transformers import AutoModel
 from sklearn.metrics import accuracy_score, roc_auc_score, confusion_matrix
 
 # 依赖检查
@@ -28,11 +27,11 @@ TARGET_HW = (192, 128)
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 BATCH_SIZE = 8
-ACCUMULATION_STEPS = 4  # 模拟有效 Batch Size = 32
-EPOCHS = 30  # 增加轮数，梯度累积后收敛变慢是正常的
+ACCUMULATION_STEPS = 4
+EPOCHS = 30
 LR_HEAD = 1e-4
 FREEZE_EPOCHS = 5
-HYBRID_PATTERN = "TMT"  # 精简架构，提高稳定性
+HYBRID_PATTERN = "TMT"
 
 
 # =========================
@@ -60,7 +59,7 @@ class SpecDataset(Dataset):
 
 
 # =========================
-# 3) 模型架构
+# 3) 模型架构 (Mamba 混合动力)
 # =========================
 class TransformerBlock(nn.Module):
     def __init__(self, d_model, nhead=8, dropout=0.1):
@@ -75,8 +74,8 @@ class BiMambaBlock(nn.Module):
     def __init__(self, d_model, d_state=16, d_conv=4, dropout=0.1):
         super().__init__()
         self.ln = nn.LayerNorm(d_model)
-        self.m_f = Mamba(d_model, d_state, d_conv, expand=2)
-        self.m_b = Mamba(d_model, d_state, d_conv, expand=2)
+        self.m_f = Mamba(d_model=d_model, d_state=d_state, d_conv=d_conv, expand=2)
+        self.m_b = Mamba(d_model=d_model, d_state=d_state, d_conv=d_conv, expand=2)
         self.drop = nn.Dropout(dropout)
 
     def forward(self, x):
@@ -103,7 +102,7 @@ class HeARHybridBinary(nn.Module):
 
 
 # =========================
-# 4) 损失函数与评估
+# 4) 损失函数与评估 (修复逻辑)
 # =========================
 class FocalLoss(nn.Module):
     def __init__(self, alpha=0.4, gamma=2.0):
@@ -123,21 +122,27 @@ def evaluate(model, loader):
     ys, probs = [], []
     for xb, yb in loader:
         p = torch.sigmoid(model(xb.to(DEVICE)))
-        ys.append(yb.numpy());
+        ys.append(yb.numpy())
         probs.append(p.cpu().numpy())
     y_true, y_prob = np.concatenate(ys), np.concatenate(probs)
     y_pred = (y_prob >= 0.5).astype(int)
     auc = roc_auc_score(y_true, y_prob)
     cm = confusion_matrix(y_true, y_pred)
     tn, fp, fn, tp = cm.ravel()
-    return {"AUC": auc, "Sens": tp / (tp + fn + 1e-8), "Spec": tn / (tn + fp + 1e-8), "CM": cm}
+    # 返回扁平化的字典，避免解包错误
+    return {
+        "AUC": auc,
+        "Sens": tp / (tp + fn + 1e-8),
+        "Spec": tn / (tn + fp + 1e-8),
+        "CM": cm
+    }
 
 
 # =========================
-# 5) 主程序
+# 5) 主训练循环 (修复 Scheduler 和 Accumulation)
 # =========================
 def main():
-    print(f"Device: {DEVICE} | Accumulation Steps: {ACCUMULATION_STEPS}")
+    print(f"Device: {DEVICE} | Using Mamba Hybrid Pattern: {HYBRID_PATTERN}")
     meta = pd.read_csv(META_CSV)
     y = (meta["label_4class"].to_numpy() != 0).astype(int)
     groups = meta["wav_name"].apply(
@@ -154,7 +159,6 @@ def main():
     base = AutoModel.from_pretrained("google/hear-pytorch", trust_remote_code=True)
     model = HeARHybridBinary(base, pattern=HYBRID_PATTERN).to(DEVICE)
 
-    # 冻结初始
     for p in model.hear.parameters(): p.requires_grad = False
 
     criterion = FocalLoss(alpha=0.4, gamma=2.0)
@@ -167,13 +171,14 @@ def main():
 
     for epoch in range(1, EPOCHS + 1):
         if epoch == FREEZE_EPOCHS + 1:
-            print(f"\n>>> Unfreezing Backbone | Switching to Layer-wise LR")
+            print(f"\n>>> Unfreezing Backbone...")
             for p in model.hear.parameters(): p.requires_grad = True
             optimizer = torch.optim.AdamW([
                 {"params": model.hear.parameters(), "lr": 5e-7},
                 {"params": model.hybrid.parameters(), "lr": 5e-5},
                 {"params": model.head.parameters(), "lr": 2e-5}
             ], weight_decay=1e-4)
+            # 重置调度器
             scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS - FREEZE_EPOCHS)
 
         model.train()
@@ -190,10 +195,11 @@ def main():
                 optimizer.step()
                 optimizer.zero_grad()
 
-        # 修复调度器顺序：在 optimizer.step() 之后
+        # 严格遵守 step 顺序
         scheduler.step()
 
-        res = evaluate(model, test_loader)[0]
+        # 修正 KeyError 的调用方式
+        res = evaluate(model, test_loader)
         print(f"{epoch:<6} | {res['AUC']:.4f} | {res['Sens']:.4f} | {res['Spec']:.4f}")
 
         if res['AUC'] > best_auc:
