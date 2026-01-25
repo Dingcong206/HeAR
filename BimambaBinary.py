@@ -1,20 +1,19 @@
 import os
 import re
-import time
 import warnings
 from typing import Tuple
-
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-
+import seaborn as sns
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 
 from sklearn.model_selection import GroupShuffleSplit
-from sklearn.metrics import accuracy_score, f1_score, classification_report, confusion_matrix
 
+from sklearn.metrics import roc_auc_score, recall_score, precision_score
 from transformers import AutoModel, AutoConfig
 
 warnings.filterwarnings("ignore")
@@ -217,27 +216,63 @@ class HeARHybridBinary(nn.Module):
 # 6) Eval & Utils
 # =========================
 @torch.no_grad()
+@torch.no_grad()
 def evaluate(model, loader):
     model.eval()
-    ys, ps = [], []
+    ys_true, ys_pred, ys_probs = [], [], []
+
     for xb, yb in loader:
         xb = xb.to(DEVICE, non_blocking=True)
         logits = model(xb)
-        prob = torch.sigmoid(logits)
-        pred = (prob >= 0.5).long().cpu().numpy()
-        ys.append(yb.numpy().astype(int))
-        ps.append(pred)
-    y_true = np.concatenate(ys)
-    y_pred = np.concatenate(ps)
-    return accuracy_score(y_true, y_pred), f1_score(y_true, y_pred), confusion_matrix(y_true, y_pred,
-                                                                                      labels=[0, 1]), y_true, y_pred
+        probs = torch.sigmoid(logits)
+        preds = (probs >= 0.5).long()
+
+        ys_true.append(yb.cpu().numpy())
+        ys_pred.append(preds.cpu().numpy())
+        ys_probs.append(probs.cpu().numpy())
+
+    y_true = np.concatenate(ys_true)
+    y_pred = np.concatenate(ys_pred)
+    y_probs = np.concatenate(ys_probs)
+
+    # 计算各项指标
+    acc = accuracy_score(y_true, y_pred)
+    auc = roc_auc_score(y_true, y_probs)
+    f1 = f1_score(y_true, y_pred)
+    recall = recall_score(y_true, y_pred)  # Recall 同 Sensitivity
+
+    cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
+    tn, fp, fn, tp = cm.ravel()
+
+    sensitivity = tp / (tp + fn + 1e-6)
+    specificity = tn / (tn + fp + 1e-6)
+
+    metrics = {
+        "Accuracy": acc,
+        "AUC": auc,
+        "F1": f1,
+        "Recall": recall,
+        "Sensitivity": sensitivity,
+        "Specificity": specificity,
+        "CM": cm
+    }
+    return metrics, y_true, y_pred
 
 
 def set_requires_grad(module: nn.Module, flag: bool):
     for p in module.parameters():
         p.requires_grad = flag
 
-
+def save_confusion_matrix(cm, epoch, f1):
+    plt.figure(figsize=(6, 5))
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
+                xticklabels=['Normal', 'Abnormal'],
+                yticklabels=['Normal', 'Abnormal'])
+    plt.title(f'Confusion Matrix Epoch {epoch} (F1: {f1:.4f})')
+    plt.ylabel('Actual')
+    plt.xlabel('Predicted')
+    plt.savefig(f"best_confusion_matrix.png")
+    plt.close()
 # =========================
 # 7) Main
 # =========================
@@ -286,9 +321,12 @@ def main():
     ], weight_decay=WEIGHT_DECAY)
 
     criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
-
     best_f1 = -1.0
+    print(f"{'Epoch':<8} | {'Acc':<8} | {'AUC':<8} | {'F1':<8} | {'Sens':<8} | {'Spec':<8}")
+    print("-" * 60)
+
     for epoch in range(1, EPOCHS + 1):
+        # --- 训练逻辑 ---
         if epoch == FREEZE_EPOCHS + 1:
             set_requires_grad(model.hear, True)
             optimizer.add_param_group({"params": model.hear.parameters(), "lr": LR_BACKBONE})
@@ -301,13 +339,34 @@ def main():
             loss.backward()
             optimizer.step()
 
-        acc, f1, cm, _, _ = evaluate(model, test_loader)
-        print(f"Epoch {epoch} | F1: {f1:.4f} | Acc: {acc:.4f}")
+        # --- 评估逻辑 ---
+        m, y_true, y_pred = evaluate(model, test_loader)
 
-        if f1 > best_f1:
-            best_f1 = f1
+        # 实时打印主要指标
+        print(
+            f"{epoch:<8} | {m['Accuracy']:.4f} | {m['AUC']:.4f} | {m['F1']:.4f} | {m['Sensitivity']:.4f} | {m['Specificity']:.4f}")
+
+        # 保存表现最好的模型和对应的详细数据
+        if m['F1'] > best_f1:
+            best_f1 = m['F1']
             torch.save(model.state_dict(), "best_model.pt")
 
+            # 保存混淆矩阵图片
+            save_confusion_matrix(m['CM'], epoch, m['F1'])
+
+            # 记录当前最优的一组数值，方便最后查看
+            best_metrics_summary = m
+
+    print("\n" + "=" * 30)
+    print("Training Finished!")
+    print(f"Best F1 Score: {best_f1:.4f}")
+    print("Best Metrics Summary:")
+    for k, v in best_metrics_summary.items():
+        if k != "CM":
+            print(f" - {k}: {v:.4f}")
+    print("Confusion Matrix:")
+    print(best_metrics_summary["CM"])
+    print("=" * 30)
 
 if __name__ == "__main__":
     main()
