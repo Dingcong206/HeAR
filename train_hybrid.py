@@ -2,14 +2,15 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset
+import pandas as pd
 import librosa
-import numpy as np
+import os
 from mamba_ssm import Mamba
 from transformers import AutoModel, AutoConfig
 
 
 # ==========================================
-# 1. 核心架构 (HeAR-TMT Hybrid)
+# 1. 架构定义 (保持 TMT 混合结构)
 # ==========================================
 class BiMambaBlock(nn.Module):
     def __init__(self, d_model, d_state=16, d_conv=4, expand=2):
@@ -33,7 +34,6 @@ class HeARTMTHybridModel(nn.Module):
         config = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
         d_model = config.hidden_size  # 1024
 
-        # Backbone
         self.base = AutoModel.from_pretrained(model_id, config=config, trust_remote_code=True, add_pooling_layer=False)
         self.embeddings = self.base.embeddings
         self.first_T = nn.ModuleList(self.base.encoder.layer[:8])
@@ -41,7 +41,6 @@ class HeARTMTHybridModel(nn.Module):
         self.last_T = nn.ModuleList(self.base.encoder.layer[-8:])
         self.layernorm = self.base.layernorm
 
-        # 分类头 (ICBHI 四分类: Normal, Crackle, Wheeze, Both)
         self.classifier = nn.Sequential(
             nn.Linear(d_model, 512),
             nn.ReLU(),
@@ -50,69 +49,67 @@ class HeARTMTHybridModel(nn.Module):
         )
 
     def forward(self, x):
-        # x: (B, 1, 192, 128)
         x = self.embeddings(x)
         for blk in self.first_T: x = blk(x)[0]
         if x.dim() == 2: x = x.unsqueeze(0)
         for m_blk in self.middle_M: x = m_blk(x)
         for blk in self.last_T: x = blk(x)[0]
         x = self.layernorm(x)
-
-        # 聚合 & 分类
         global_feat = x.mean(dim=1)
         return self.classifier(global_feat)
 
 
 # ==========================================
-# 2. ICBHI 数据预处理 (适配 HeAR)
+# 2. ICBHI Dataset (读取 CSV)
 # ==========================================
-class ICBHIDataset(Dataset):
-    def __init__(self, file_list, labels, sr=16000, duration=5):
-        self.file_list = file_list
-        self.labels = labels
+class ICBHICSVDataset(Dataset):
+    def __init__(self, csv_path, sr=16000, duration=5):
+        self.df = pd.read_csv(csv_path)
+        # 假设你的 CSV 列名是 'file_path' 和 'label'
+        self.file_list = self.df['file_path'].values
+        self.labels = self.df['label'].values
         self.sr = sr
-        self.duration = duration
         self.target_length = sr * duration
 
     def __len__(self):
         return len(self.file_list)
 
     def __getitem__(self, idx):
-        # 1. 加载音频
-        wav, _ = librosa.load(self.file_list[idx], sr=self.sr)
+        wav_path = self.file_list[idx]
+        wav, _ = librosa.load(wav_path, sr=self.sr)
 
-        # 2. 长度填充/裁剪 (5秒)
+        # 填充/裁剪至 5秒
         if len(wav) > self.target_length:
             wav = wav[:self.target_length]
         else:
             wav = np.pad(wav, (0, self.target_length - len(wav)))
 
-        # 3. 转换为 Log-Mel Spectrogram (适配 HeAR 输入尺寸 192x128)
-        # 注意：这里需要精确控制参数以获得 192x128 的形状
+        # 生成适配 HeAR 的 192x128 频谱图
         mel_spec = librosa.feature.melspectrogram(y=wav, sr=self.sr, n_mels=192, n_fft=1024, hop_length=626)
         log_mel = librosa.power_to_db(mel_spec, ref=np.max)
 
-        # 4. 归一化并转为 Tensor
+        # 归一化
         log_mel = (log_mel - log_mel.mean()) / (log_mel.std() + 1e-6)
-        tensor_mel = torch.from_numpy(log_mel).unsqueeze(0).float()  # (1, 192, 128)
+        tensor_mel = torch.from_numpy(log_mel).unsqueeze(0).float()
 
         return tensor_mel[:, :192, :128], torch.tensor(self.labels[idx]).long()
 
 
 # ==========================================
-# 3. 训练与评估策略
+# 3. 训练启动脚本
 # ==========================================
-def train_icbhi():
-    # 模拟数据列表 (实际使用时请替换为 ICBHI 的 .wav 路径)
-    fake_files = ["sample.wav"] * 20
-    fake_labels = [0, 1, 2, 3] * 5
+def run_train():
+    # --- 请在这里填写你的 CSV 路径 ---
+    CSV_PATH = "icbhi_hear_embeddings_4class_meta.csv"
 
-    dataset = ICBHIDataset(fake_files, fake_labels)
-    loader = DataLoader(dataset, batch_size=8, shuffle=True)
+    # 初始化数据
+    dataset = ICBHICSVDataset(CSV_PATH)
+    train_loader = DataLoader(dataset, batch_size=2, shuffle=True, num_workers=4)
 
+    # 初始化模型
     model = HeARTMTHybridModel().cuda()
 
-    # --- 训练策略：第一阶段冻结 ---
+    # 第一阶段策略：冻结 Transformer
     for name, param in model.named_parameters():
         if "middle_M" in name or "classifier" in name:
             param.requires_grad = True
@@ -120,12 +117,14 @@ def train_icbhi():
             param.requires_grad = False
 
     optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=1e-4)
-    criterion = nn.CrossEntropyLoss()  # 四分类
+    criterion = nn.CrossEntropyLoss()
 
-    print("开始 ICBHI 适配训练...")
-    model.train()
-    for epoch in range(10):
-        for images, labels in loader:
+    print(f"数据加载完成，共 {len(dataset)} 条样本。开始训练...")
+
+    for epoch in range(20):
+        model.train()
+        total_loss = 0
+        for images, labels in train_loader:
             images, labels = images.cuda(), labels.cuda()
 
             optimizer.zero_grad()
@@ -133,12 +132,13 @@ def train_icbhi():
             loss = criterion(outputs, labels)
             loss.backward()
             optimizer.step()
+            total_loss += loss.item()
 
-        print(f"Epoch {epoch + 1} Loss: {loss.item():.4f}")
+        print(f"Epoch {epoch + 1}/20, Loss: {total_loss / len(train_loader):.4f}")
 
-    # 保存权重
-    torch.save(model.state_dict(), "icbhi_hear_tmt.pth")
+    torch.save(model.state_dict(), "final_hear_tmt_icbhi.pth")
+    print("训练结束，权重已保存。")
 
 
 if __name__ == "__main__":
-    train_icbhi()
+    run_train()
