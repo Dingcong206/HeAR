@@ -80,7 +80,7 @@ class ICBHICSVDataset(Dataset):
         # 获取文件名（例如 101_1b1_Al_sc_Meditron.wav）
         file_name = os.path.basename(win_path.replace('\\', '/'))
         # 拼接服务器上的真实目录
-        wav_path = os.path.join("/data/dingcong/HeAR/ICBHI_final_database/", file_name)
+        wav_path = os.path.join("/data/dingcong/HeAR/ICBHI_final_database/icbhi_hear_embeddings_4class_meta.csv", file_name)
 
         # 加载音频
         try:
