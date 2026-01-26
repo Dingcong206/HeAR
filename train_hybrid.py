@@ -11,6 +11,10 @@ from torch.utils.data import Dataset, DataLoader, random_split
 from mamba_ssm import Mamba
 from transformers import AutoModel, AutoConfig
 
+from sklearn.metrics import accuracy_score, f1_score, confusion_matrix, roc_auc_score
+import matplotlib.pyplot as plt
+import seaborn as sns
+
 
 # ==========================================
 # 1) BiMamba Block
@@ -41,9 +45,17 @@ class BiMambaBlock(nn.Module):
 # 2) HeAR-TMT Hybrid Model
 # ==========================================
 class HeARTMTHybridModel(nn.Module):
-    def __init__(self, model_id="google/hear-pytorch", num_classes=4,
-                 n_first=8, n_last=8, n_mamba=4,
-                 d_state=16, d_conv=4, expand=2):
+    def __init__(
+        self,
+        model_id="google/hear-pytorch",
+        num_classes=4,
+        n_first=8,
+        n_last=8,
+        n_mamba=4,
+        d_state=16,
+        d_conv=4,
+        expand=2,
+    ):
         super().__init__()
 
         config = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
@@ -110,6 +122,7 @@ class HeARTMTHybridModel(nn.Module):
         return out
 
     def forward(self, x):
+        # x: (B, 1, 192, 128)
         x = self.embeddings(x)
         x = self._ensure_3d_tokens(x)
 
@@ -189,28 +202,60 @@ class ICBHICSVDataset(Dataset):
 
 
 # ==========================================
-# 4) Eval
+# 4) Full Evaluation: Acc / F1 / AUC / Confusion Matrix
 # ==========================================
 @torch.no_grad()
-def evaluate(model, loader, device):
+def evaluate_full(model, loader, device, num_classes=4, save_prefix="val"):
     model.eval()
-    crit = nn.CrossEntropyLoss()
-    total, correct = 0, 0
-    loss_sum = 0.0
+
+    all_probs = []
+    all_preds = []
+    all_labels = []
 
     for x, y in loader:
         x = x.to(device, non_blocking=True)
         y = y.to(device, non_blocking=True)
 
         logits = model(x)
-        loss = crit(logits, y)
+        probs = torch.softmax(logits, dim=1)
 
-        loss_sum += float(loss.item()) * x.size(0)
-        pred = logits.argmax(dim=1)
-        correct += int((pred == y).sum().item())
-        total += int(y.size(0))
+        all_probs.append(probs.cpu())
+        all_preds.append(torch.argmax(probs, dim=1).cpu())
+        all_labels.append(y.cpu())
 
-    return loss_sum / max(total, 1), correct / max(total, 1)
+    y_true = torch.cat(all_labels).numpy()
+    y_pred = torch.cat(all_preds).numpy()
+    y_prob = torch.cat(all_probs).numpy()
+
+    acc = accuracy_score(y_true, y_pred)
+    f1_macro = f1_score(y_true, y_pred, average="macro")
+    f1_weighted = f1_score(y_true, y_pred, average="weighted")
+
+    # AUC (multi-class OvR)
+    try:
+        auc = roc_auc_score(y_true, y_prob, multi_class="ovr")
+    except Exception:
+        auc = float("nan")
+
+    cm = confusion_matrix(y_true, y_pred)
+
+    # Save confusion matrix figure
+    plt.figure(figsize=(6, 5))
+    sns.heatmap(cm, annot=True, fmt="d", cmap="Blues")
+    plt.xlabel("Predicted")
+    plt.ylabel("True")
+    plt.title(f"{save_prefix} Confusion Matrix")
+    plt.tight_layout()
+    plt.savefig(f"{save_prefix}_confusion_matrix.png")
+    plt.close()
+
+    return {
+        "acc": acc,
+        "f1_macro": f1_macro,
+        "f1_weighted": f1_weighted,
+        "auc": auc,
+        "cm": cm
+    }
 
 
 # ==========================================
@@ -224,7 +269,7 @@ def run_train():
     num_workers = 4
     epochs = 20
     lr = 5e-5          # 更稳一点
-    val_ratio = 0.1    # 10% 做验证
+    val_ratio = 0.1    # 10% 验证集
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print("Device:", device)
@@ -242,7 +287,7 @@ def run_train():
 
     model = HeARTMTHybridModel(num_classes=4).to(device)
 
-    # freeze: only middle_M + classifier
+    # Freeze: only train middle_M + classifier
     trainable_params = []
     print("\n--- Parameter freeze check ---")
     for name, p in model.named_parameters():
@@ -256,7 +301,7 @@ def run_train():
     optimizer = optim.AdamW(trainable_params, lr=lr)
     criterion = nn.CrossEntropyLoss()
 
-    # sanity forward
+    # Sanity forward
     model.train()
     x0, y0 = next(iter(train_loader))
     x0 = x0.to(device)
@@ -264,7 +309,7 @@ def run_train():
         out0 = model(x0)
     print("Sanity forward OK:", tuple(out0.shape))
 
-    best_acc = 0.0
+    best_f1 = -1.0
 
     print("\n>>> Start training...")
     for epoch in range(epochs):
@@ -285,19 +330,29 @@ def run_train():
             if i % 50 == 0:
                 print(f"Epoch {epoch+1}/{epochs} | Step {i}/{len(train_loader)} | Loss {loss.item():.4f}")
 
-        train_avg = epoch_loss / max(len(train_loader), 1)
-        val_loss, val_acc = evaluate(model, val_loader, device)
+        train_loss = epoch_loss / max(len(train_loader), 1)
 
-        print(f"--- Epoch {epoch+1} done | TrainLoss {train_avg:.4f} | ValLoss {val_loss:.4f} | ValAcc {val_acc:.4f} ---")
+        metrics = evaluate_full(model, val_loader, device, num_classes=4, save_prefix=f"val_ep{epoch+1}")
 
-        if val_acc > best_acc:
-            best_acc = val_acc
+        print(
+            f"--- Epoch {epoch+1} done | "
+            f"TrainLoss={train_loss:.4f} | "
+            f"ValAcc={metrics['acc']:.4f} | "
+            f"ValF1-macro={metrics['f1_macro']:.4f} | "
+            f"ValF1-weighted={metrics['f1_weighted']:.4f} | "
+            f"ValAUC={metrics['auc']:.4f} | "
+            f"CM saved: val_ep{epoch+1}_confusion_matrix.png ---"
+        )
+
+        # Save best by macro-F1 (recommended for imbalance)
+        if metrics["f1_macro"] > best_f1:
+            best_f1 = metrics["f1_macro"]
             torch.save(model.state_dict(), "best_hear_tmt_icbhi.pth")
-            print(f"✅ Saved best checkpoint: best_hear_tmt_icbhi.pth (ValAcc={best_acc:.4f})")
+            print(f"✅ Saved BEST model (macro-F1={best_f1:.4f}) -> best_hear_tmt_icbhi.pth")
 
     torch.save(model.state_dict(), "final_hear_tmt_icbhi.pth")
     print("Saved final: final_hear_tmt_icbhi.pth")
-    print("Best ValAcc:", best_acc)
+    print("Best macro-F1:", best_f1)
 
 
 if __name__ == "__main__":
