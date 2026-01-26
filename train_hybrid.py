@@ -58,20 +58,21 @@ class HeARTMTHybridModel(nn.Module):
         )
 
     def forward(self, x):
-        # 1. 输入校验: x 应该是 (B, 1, 192, 128)
-        x = self.embeddings(x)  # 预期: (B, 97, 1024)
+        # x 初始维度: (B, 1, 192, 128)
+        batch_size = x.shape[0]  # 记录原始 Batch 大小
+
+        # 1. 特征提取
+        x = self.embeddings(x)  # (B, 97, 1024)
 
         # 2. 前 8 层 Transformer
         for blk in self.first_T:
             x = blk(x)[0]
 
-        # --- 强力修复 1: 确保进入 Mamba 前是 3D ---
-        if x.dim() == 2:
-            x = x.unsqueeze(0)  # 将 (97, 1024) 变为 (1, 97, 1024)
-        elif x.dim() == 4:
-            x = x.squeeze(1)  # 防止出现 (B, 1, 97, 1024)
-
         # 3. 中间 4 层 BiMamba
+        # 确保进入 Mamba 前维度正确
+        if x.dim() != 3:
+            x = x.view(batch_size, -1, 1024)
+
         for m_blk in self.middle_M:
             x = m_blk(x)
 
@@ -79,22 +80,14 @@ class HeARTMTHybridModel(nn.Module):
         for blk in self.last_T:
             x = blk(x)[0]
 
-        # --- 强力修复 2: 确保进入 LayerNorm 前是 3D ---
-        if x.dim() == 2:
-            x = x.unsqueeze(0)
-
         x = self.layernorm(x)
 
-        # 5. 聚合池化
-        # 此时 x 必须是 (B, 97, 1024)
-        # 我们明确指定在 dim=1 (即 97 所在的维度) 做平均
-        global_feat = x.mean(dim=1)
+        # 5. 聚合池化 (核心修复点)
+        # 使用 keepdim=True 保证 Batch 维度不丢失，再用 flatten 变成 (B, 1024)
+        global_feat = x.mean(dim=1, keepdim=True)  # 得到 (B, 1, 1024)
+        global_feat = global_feat.view(batch_size, -1)  # 强制转回 (B, 1024)
 
-        # --- 强力修复 3: 最后的线性层对齐 ---
-        # 如果 global_feat 变成了 (1024,)，强制转回 (1, 1024)
-        if global_feat.dim() == 1:
-            global_feat = global_feat.unsqueeze(0)
-
+        # 6. 分类器
         return self.classifier(global_feat)
 
 
