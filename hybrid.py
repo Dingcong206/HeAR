@@ -27,21 +27,40 @@ class BiMambaBlock(nn.Module):
         )
         self.dropout = nn.Dropout(0.1)
 
-    def forward(self, x):
-        # x: (Batch, Seq_Len, Dim)
-        res = x
-        x = self.norm(x)
 
-        # 正向处理
-        out_fwd = self.mamba_fwd(x)
+def forward(self, pixel_values):
+    # 1. Embedding 层
+    x = self.embeddings(pixel_values)
+    # 此时 x 的形状通常是 (Batch, 197, 1024) 或 (Batch, 97, 1024)
 
-        # 反向处理：翻转序列 -> 经过 Mamba -> 翻转回来
-        x_flipped = x.flip(dims=[1])
-        out_bwd = self.mamba_bwd(x_flipped).flip(dims=[1])
+    # 2. 第一段 Transformer (T)
+    for blk in self.first_T:
+        # 关键：transformers 库的 ViTLayer 返回的是 tuple (hidden_states, weights)
+        layer_outputs = blk(x)
+        x = layer_outputs[0]
 
-        # 融合与残差连接
-        return res + self.dropout(out_fwd + out_bwd)
+        # --- 修复代码开始 ---
+    # 检查维度。如果 x 是 (Batch, Dim)，说明在 T 层之后被错误聚合了
+    # 如果维度没问题，但 Mamba 报错，通常是因为 T 层的输出包含了 cls_token
+    # 我们在这里强制检查并确保 x 是 3 维的
+    if x.dim() == 2:
+        # 如果意外变成了 2 维，我们需要找到原因。但在大多数 ViT 实现中，
+        # x 应该是 (Batch, Seq_Len, Dim)
+        raise ValueError(f"Transformer 层输出维度错误，预期3维，实际得到 {x.shape}")
+    # --- 修复代码结束 ---
 
+    # 3. 中间段 BiMamba (M)
+    for mamba_blk in self.middle_M:
+        x = mamba_blk(x)
+
+    # 4. 最后一段 Transformer (T)
+    for blk in self.last_T:
+        layer_outputs = blk(x)
+        x = layer_outputs[0]
+
+    # 5. 输出
+    x = self.layernorm(x)
+    return x
 
 # =========================
 # 2) 定义 HeAR-TMT 混合模型
