@@ -5,12 +5,13 @@ from torch.utils.data import DataLoader, Dataset
 import pandas as pd
 import librosa
 import os
+import numpy as np
 from mamba_ssm import Mamba
 from transformers import AutoModel, AutoConfig
 
 
 # ==========================================
-# 1. 架构定义 (保持 TMT 混合结构)
+# 1. 架构定义 (HeAR-TMT Hybrid)
 # ==========================================
 class BiMambaBlock(nn.Module):
     def __init__(self, d_model, d_state=16, d_conv=4, expand=2):
@@ -60,12 +61,13 @@ class HeARTMTHybridModel(nn.Module):
 
 
 # ==========================================
-# 2. ICBHI Dataset (读取 CSV)
+# 2. ICBHI Dataset (包含路径自动修复)
 # ==========================================
 class ICBHICSVDataset(Dataset):
-    def __init__(self, csv_path, sr=16000, duration=5):
+    def __init__(self, csv_path, wav_dir, sr=16000, duration=5):
+        print(f"正在读取 CSV: {csv_path}")
         self.df = pd.read_csv(csv_path)
-        # 对应你 CSV 的列名
+        self.wav_dir = wav_dir
         self.file_paths = self.df['wav_path'].values
         self.labels = self.df['label_4class'].values
         self.sr = sr
@@ -75,54 +77,50 @@ class ICBHICSVDataset(Dataset):
         return len(self.file_paths)
 
     def __getitem__(self, idx):
-        # --- 核心修复：将 Windows 路径转换为 Linux 路径 ---
+        # 将 Windows 路径转换为文件名，并拼接 Linux 本地目录
         win_path = self.file_paths[idx]
-        # 获取文件名（例如 101_1b1_Al_sc_Meditron.wav）
         file_name = os.path.basename(win_path.replace('\\', '/'))
-        # 拼接服务器上的真实目录
-        wav_path = os.path.join("/data/dingcong/HeAR/ICBHI_final_database/icbhi_hear_embeddings_4class_meta.csv", file_name)
+        wav_path = os.path.join(self.wav_dir, file_name)
 
-        # 加载音频
         try:
             wav, _ = librosa.load(wav_path, sr=self.sr)
         except Exception as e:
-            print(f"无法加载文件 {wav_path}, 请检查路径是否正确。错误: {e}")
-            # 返回全零数据防止训练崩溃
+            # 如果找不到文件，打印警告并返回静音
             wav = np.zeros(self.target_length)
 
-        # 填充/裁剪至 5秒
         if len(wav) > self.target_length:
             wav = wav[:self.target_length]
         else:
             wav = np.pad(wav, (0, self.target_length - len(wav)))
 
-        # 生成频谱图 (192, 128)
+        # 生成 192x128 频谱
         mel_spec = librosa.feature.melspectrogram(y=wav, sr=self.sr, n_mels=192, n_fft=1024, hop_length=626)
         log_mel = librosa.power_to_db(mel_spec, ref=np.max)
-
-        # 归一化
         log_mel = (log_mel - log_mel.mean()) / (log_mel.std() + 1e-6)
         tensor_mel = torch.from_numpy(log_mel).unsqueeze(0).float()
 
-        # 确保尺寸严格为 192x128
         return tensor_mel[:, :192, :128], torch.tensor(self.labels[idx]).long()
 
 
 # ==========================================
-# 3. 训练启动脚本
+# 3. 运行脚本
 # ==========================================
 def run_train():
-    # --- 请在这里填写你的 CSV 路径 ---
-    CSV_PATH = "icbhi_hear_embeddings_4class_meta.csv"
+    # --- 修正后的绝对路径 ---
+    CSV_PATH = "/data/dingcong/HeAR/ICBHI_final_database/icbhi_hear_embeddings_4class_meta.csv"
+    WAV_DIR = "/data/dingcong/HeAR/ICBHI_final_database/"
 
-    # 初始化数据
-    dataset = ICBHICSVDataset(CSV_PATH)
+    if not os.path.exists(CSV_PATH):
+        raise FileNotFoundError(f"找不到 CSV 文件: {CSV_PATH}")
+
+    # 初始化数据和加载器
+    dataset = ICBHICSVDataset(CSV_PATH, WAV_DIR)
     train_loader = DataLoader(dataset, batch_size=2, shuffle=True, num_workers=4)
 
-    # 初始化模型
+    # 初始化模型并移至 GPU
     model = HeARTMTHybridModel().cuda()
 
-    # 第一阶段策略：冻结 Transformer
+    # 第一阶段策略：冻结除 Mamba 和 Classifier 以外的层
     for name, param in model.named_parameters():
         if "middle_M" in name or "classifier" in name:
             param.requires_grad = True
@@ -132,7 +130,8 @@ def run_train():
     optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=1e-4)
     criterion = nn.CrossEntropyLoss()
 
-    print(f"数据加载完成，共 {len(dataset)} 条样本。开始训练...")
+    print(f">>> 数据准备就绪，样本数: {len(dataset)}")
+    print(">>> 开始训练...")
 
     for epoch in range(20):
         model.train()
@@ -147,10 +146,10 @@ def run_train():
             optimizer.step()
             total_loss += loss.item()
 
-        print(f"Epoch {epoch + 1}/20, Loss: {total_loss / len(train_loader):.4f}")
+        print(f"Epoch {epoch + 1}/20 | Loss: {total_loss / len(train_loader):.4f}")
 
     torch.save(model.state_dict(), "final_hear_tmt_icbhi.pth")
-    print("训练结束，权重已保存。")
+    print("训练成功结束，权重已保存为 final_hear_tmt_icbhi.pth")
 
 
 if __name__ == "__main__":
