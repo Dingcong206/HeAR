@@ -65,18 +65,30 @@ class HeARTMTHybridModel(nn.Module):
 class ICBHICSVDataset(Dataset):
     def __init__(self, csv_path, sr=16000, duration=5):
         self.df = pd.read_csv(csv_path)
-        # 假设你的 CSV 列名是 'file_path' 和 'label'
-        self.file_list = self.df['file_path'].values
-        self.labels = self.df['label'].values
+        # 对应你 CSV 的列名
+        self.file_paths = self.df['wav_path'].values
+        self.labels = self.df['label_4class'].values
         self.sr = sr
         self.target_length = sr * duration
 
     def __len__(self):
-        return len(self.file_list)
+        return len(self.file_paths)
 
     def __getitem__(self, idx):
-        wav_path = self.file_list[idx]
-        wav, _ = librosa.load(wav_path, sr=self.sr)
+        # --- 核心修复：将 Windows 路径转换为 Linux 路径 ---
+        win_path = self.file_paths[idx]
+        # 获取文件名（例如 101_1b1_Al_sc_Meditron.wav）
+        file_name = os.path.basename(win_path.replace('\\', '/'))
+        # 拼接服务器上的真实目录
+        wav_path = os.path.join("/data/dingcong/HeAR/ICBHI_final_database/", file_name)
+
+        # 加载音频
+        try:
+            wav, _ = librosa.load(wav_path, sr=self.sr)
+        except Exception as e:
+            print(f"无法加载文件 {wav_path}, 请检查路径是否正确。错误: {e}")
+            # 返回全零数据防止训练崩溃
+            wav = np.zeros(self.target_length)
 
         # 填充/裁剪至 5秒
         if len(wav) > self.target_length:
@@ -84,7 +96,7 @@ class ICBHICSVDataset(Dataset):
         else:
             wav = np.pad(wav, (0, self.target_length - len(wav)))
 
-        # 生成适配 HeAR 的 192x128 频谱图
+        # 生成频谱图 (192, 128)
         mel_spec = librosa.feature.melspectrogram(y=wav, sr=self.sr, n_mels=192, n_fft=1024, hop_length=626)
         log_mel = librosa.power_to_db(mel_spec, ref=np.max)
 
@@ -92,6 +104,7 @@ class ICBHICSVDataset(Dataset):
         log_mel = (log_mel - log_mel.mean()) / (log_mel.std() + 1e-6)
         tensor_mel = torch.from_numpy(log_mel).unsqueeze(0).float()
 
+        # 确保尺寸严格为 192x128
         return tensor_mel[:, :192, :128], torch.tensor(self.labels[idx]).long()
 
 
