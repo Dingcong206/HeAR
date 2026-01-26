@@ -83,17 +83,34 @@ class HeARTMTHybrid(nn.Module):
 # =========================
 # 3) 分类器 (Head)
 # =========================
-class HeARHybridClassifier(nn.Module):
-    def __init__(self, tmt_backbone):
-        super().__init__()
-        self.backbone = tmt_backbone
-        self.classifier = nn.Sequential(
-            nn.Linear(1024, 512),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(512, 1)
-        )
+    class HeARHybridClassifier(nn.Module):
+        def __init__(self, tmt_backbone):
+            super().__init__()
+            self.backbone = tmt_backbone
+            self.classifier = nn.Sequential(
+                nn.Linear(1024, 512),
+                nn.ReLU(),
+                nn.Dropout(0.3),
+                nn.Linear(512, 1)
+            )
 
+        def forward(self, x):
+            # 1. 获取特征
+            features = self.backbone(x)  # 预期: (B, 97, 1024)
+
+            # 2. 维度安全检查与修正
+            # 如果出现 (B, 1024, 97) 的情况，进行转置
+            if features.shape[-1] == 97 and features.shape[-2] == 1024:
+                features = features.transpose(1, 2)
+
+            # 3. 聚合
+            # 必须确保在 dim=1 (97那个维度) 上取平均，得到 (B, 1024)
+            global_feat = features.mean(dim=1)
+
+            # 4. 调试打印 (仅执行一次后可删除)
+            # print(f"Global feat shape: {global_feat.shape}")
+
+            return self.classifier(global_feat).squeeze(-1)
     def forward(self, x):
         # 获取 TMT 混合特征 (B, 97, 1024)
         features = self.backbone(x)
