@@ -19,9 +19,9 @@ META_CSV = os.path.join(DATASET_ROOT, "icbhi_hear_embeddings_4class_meta.csv")
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 BATCH_SIZE = 128
 EPOCHS = 100
-LR = 1e-4  # MLP 建议使用较小的学习率
+LR = 1e-4
 WEIGHT_DECAY = 1e-4
-PATIENCE = 15  # 给 MLP 更多收敛时间
+PATIENCE = 15
 
 
 # =========================
