@@ -51,28 +51,22 @@ class HeARTMTHybrid(nn.Module):
         self.layernorm = self.base.layernorm
 
     def forward(self, pixel_values):
-        # 输入: (B, 1, 192, 128) -> 输出: (B, 97, 1024)
-        x = self.embeddings(pixel_values)
+        x = self.embeddings(pixel_values)  # (B, 97, 1024)
 
-        # 第一阶段: Transformer
         for blk in self.first_T:
             x = blk(x)[0]
 
-        # 维度容错处理 (针对 Batch=1 的情况)
-        if x.dim() == 2:
-            x = x.unsqueeze(0)
+        # 确保进入 Mamba 前是 (B, L, D)
+        if x.dim() == 2: x = x.unsqueeze(0)
 
-        # 第二阶段: BiMamba
         for mamba_blk in self.middle_M:
             x = mamba_blk(x)
 
-        # 第三阶段: Transformer
         for blk in self.last_T:
             x = blk(x)[0]
 
         x = self.layernorm(x)
-        return x
-
+        return x  # 确保这里不做任何 transpose
 
 # =========================
 # 3) 用于分类的完整模型 (必须在调用前定义)
@@ -81,7 +75,6 @@ class HeARHybridClassifier(nn.Module):
     def __init__(self, tmt_backbone):
         super().__init__()
         self.backbone = tmt_backbone
-        # 维度对齐：1024 是 HeAR 的输出维度
         self.classifier = nn.Sequential(
             nn.Linear(1024, 512),
             nn.ReLU(),
@@ -90,13 +83,26 @@ class HeARHybridClassifier(nn.Module):
         )
 
     def forward(self, x):
-        # 1. 经过 TMT Backbone 得到 (B, 97, 1024)
+        # 1. 获取特征 (B, 97, 1024)
         features = self.backbone(x)
 
-        # 2. 在时间步维度 (dim=1) 取平均，得到 (B, 1024)
-        global_feat = features.mean(dim=1)
+        # --- 健壮性修复：如果 Batch 维丢失，强制补回 ---
+        if features.dim() == 2:  # 变成了 (97, 1024)
+            features = features.unsqueeze(0)  # 补回为 (1, 97, 1024)
 
-        # 3. 分类输出
+        # 2. 检查维度顺序
+        # 如果末尾是 97，说明 1024 在中间，需要转置
+        if features.shape[-1] == 97:
+            features = features.transpose(1, 2)
+
+        # 3. 聚合：在时间序列维度(97)取平均，保留特征维度(1024)
+        # 关键：dim=1 必须对应序列长度那一维
+        global_feat = features.mean(dim=1)  # 得到 (B, 1024)
+
+        # 4. 如果 mean 之后变成了 (1024,)，补回 Batch 维
+        if global_feat.dim() == 1:
+            global_feat = global_feat.unsqueeze(0)
+
         return self.classifier(global_feat).squeeze(-1)
 
 
