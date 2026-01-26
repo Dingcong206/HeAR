@@ -1,359 +1,189 @@
-import os
-import numpy as np
-import pandas as pd
-import librosa
-
 import torch
 import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader, random_split
-
-from mamba_ssm import Mamba
-from transformers import AutoModel, AutoConfig
-
-from sklearn.metrics import accuracy_score, f1_score, confusion_matrix, roc_auc_score
-import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
 import seaborn as sns
+import matplotlib.pyplot as plt
+from torch.utils.data import DataLoader, TensorDataset
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import roc_auc_score, confusion_matrix, f1_score, classification_report
+
+try:
+    from mamba_ssm import Mamba
+except ImportError:
+    print("请安装 mamba: pip install mamba-ssm causal-conv1d")
 
 
-# ==========================================
-# 1) BiMamba Block
-# ==========================================
-class BiMambaBlock(nn.Module):
-    def __init__(self, d_model, d_state=16, d_conv=4, expand=2, dropout=0.1):
-        super().__init__()
-        self.norm = nn.LayerNorm(d_model)
-        self.mamba_fwd = Mamba(d_model=d_model, d_state=d_state, d_conv=d_conv, expand=expand)
-        self.mamba_bwd = Mamba(d_model=d_model, d_state=d_state, d_conv=d_conv, expand=expand)
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, x):
-        # Ensure (B, L, D)
-        if x.dim() == 2:
-            x = x.unsqueeze(1)
-        if x.dim() != 3:
-            raise RuntimeError(f"BiMambaBlock expects 3D (B,L,D), got {tuple(x.shape)}")
-
-        res = x
-        x = self.norm(x)
-        out_fwd = self.mamba_fwd(x)
-        out_bwd = self.mamba_bwd(x.flip(dims=[1])).flip(dims=[1])
-        return res + self.dropout(out_fwd + out_bwd)
-
-
-# ==========================================
-# 2) HeAR-TMT Hybrid Model
-# ==========================================
-class HeARTMTHybridModel(nn.Module):
-    def __init__(
-        self,
-        model_id="google/hear-pytorch",
-        num_classes=4,
-        n_first=8,
-        n_last=8,
-        n_mamba=4,
-        d_state=16,
-        d_conv=4,
-        expand=2,
-    ):
+# =========================
+# 1) BiMamba-Attention Hybrid 模型
+# =========================
+class HeARBiMambaHybridClassifier(nn.Module):  # 类名更改，以示区别
+    def __init__(self, input_dim=1024, d_state=16, d_conv=4, expand=2, num_heads=8, dropout_rate=0.4):
         super().__init__()
 
-        config = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
-        self.base = AutoModel.from_pretrained(
-            model_id,
-            config=config,
-            trust_remote_code=True,
-            add_pooling_layer=False
+        # 正向 Mamba
+        self.mamba_fwd = Mamba(
+            d_model=input_dim,
+            d_state=d_state,
+            d_conv=d_conv,
+            expand=expand
+        )
+        # 反向 Mamba
+        self.mamba_bwd = Mamba(
+            d_model=input_dim,
+            d_state=d_state,
+            d_conv=d_conv,
+            expand=expand
         )
 
-        d_model = getattr(config, "hidden_size", None) or getattr(config, "d_model", None)
-        if d_model is None:
-            raise RuntimeError("Cannot infer hidden size from config (hidden_size/d_model).")
+        # 新增：Multi-Head Self-Attention (MHSA) 层
+        # embed_dim 必须等于 input_dim
+        self.attention = nn.MultiheadAttention(embed_dim=input_dim, num_heads=num_heads, batch_first=True)
+        self.attn_norm = nn.LayerNorm(input_dim)
+        self.attn_dropout = nn.Dropout(dropout_rate)
 
-        self.embeddings = self.base.embeddings
-        self.first_T = nn.ModuleList(self.base.encoder.layer[:n_first])
-        self.middle_M = nn.ModuleList([
-            BiMambaBlock(d_model=d_model, d_state=d_state, d_conv=d_conv, expand=expand)
-            for _ in range(n_mamba)
-        ])
-        self.last_T = nn.ModuleList(self.base.encoder.layer[-n_last:])
-        self.layernorm = self.base.layernorm
+        # 层归一化 (用于 Mamba + Attention 融合后的输出)
+        self.norm = nn.LayerNorm(input_dim)
 
+        # 分类头：因为是双向融合 + Attention，输入维度依然是 input_dim
         self.classifier = nn.Sequential(
-            nn.Linear(d_model, 512),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(512, num_classes)
+            nn.Linear(input_dim, 512),
+            nn.BatchNorm1d(512),
+            nn.GELU(),
+            nn.Dropout(dropout_rate),  # 使用传入的 dropout_rate
+            nn.Linear(512, 1)
         )
-
-        self._printed = False  # debug prints once
-
-    @staticmethod
-    def _ensure_3d_tokens(x: torch.Tensor) -> torch.Tensor:
-        """
-        Ensure x is (B, L, D).
-        - (B, D)        -> (B, 1, D)
-        - (B, D, H, W)  -> (B, H*W, D)
-        - (B, D, L)     -> (B, L, D)
-        - (B, L, D)     -> keep
-        """
-        if x.dim() == 2:
-            return x.unsqueeze(1).contiguous()
-
-        if x.dim() == 4:
-            return x.flatten(2).transpose(1, 2).contiguous()
-
-        if x.dim() == 3:
-            B, A, C = x.shape
-            # heuristic transpose if looks like (B, D, L)
-            if A >= 256 and C < A:
-                return x.transpose(1, 2).contiguous()
-            return x.contiguous()
-
-        raise RuntimeError(f"Unexpected tensor shape: {tuple(x.shape)}")
-
-    @staticmethod
-    def _unwrap_block_output(out):
-        # HF blocks often return tuple (hidden_states, ...)
-        if isinstance(out, tuple):
-            return out[0]
-        if isinstance(out, dict) and "last_hidden_state" in out:
-            return out["last_hidden_state"]
-        return out
 
     def forward(self, x):
-        # x: (B, 1, 192, 128)
-        x = self.embeddings(x)
-        x = self._ensure_3d_tokens(x)
+        # x: (Batch, 97, 1024) - 原始输入
 
-        if not self._printed:
-            print("[DEBUG] after embeddings:", tuple(x.shape))
+        # 1. 正向路径
+        x_fwd = self.mamba_fwd(x)
 
-        for blk in self.first_T:
-            x = self._unwrap_block_output(blk(x))
-            x = self._ensure_3d_tokens(x)
+        # 2. 反向路径：将序列翻转 -> 经过 Mamba -> 再翻转回来
+        x_bwd_flipped = self.mamba_bwd(x.flip(dims=[1]))
+        x_bwd = x_bwd_flipped.flip(dims=[1])
 
-        if not self._printed:
-            print("[DEBUG] after first_T:", tuple(x.shape))
+        # 3. 双向 Mamba 融合 (相加)
+        x_mamba_output = x_fwd + x_bwd  # (Batch, 97, 1024)
 
-        for m_blk in self.middle_M:
-            x = self._ensure_3d_tokens(x)
-            x = m_blk(x)
+        # 4. 新增：Multi-Head Self-Attention 模块
+        # 注意力层输入要求 (Batch, SeqLen, EmbedDim)
+        # query, key, value 都使用 x_mamba_output
+        attn_output, _ = self.attention(x_mamba_output, x_mamba_output, x_mamba_output)
+        attn_output = self.attn_dropout(attn_output)
 
-        if not self._printed:
-            print("[DEBUG] after middle_M:", tuple(x.shape))
+        # 5. 残差连接：将 Mamba 输出与 Attention 输出相加，并进行层归一化
+        # 这就是 Mamba 和 Attention 的核心 Hybrid 融合点
+        x_hybrid = self.attn_norm(x_mamba_output + attn_output)  # (Batch, 97, 1024)
 
-        for blk in self.last_T:
-            x = self._unwrap_block_output(blk(x))
-            x = self._ensure_3d_tokens(x)
+        # 6. 最终的层归一化 (可选，但推荐保留)
+        x_hybrid = self.norm(x_hybrid)
 
-        x = self.layernorm(x)
+        # 7. 统计池化 (保持不变)
+        avg_pool = x_hybrid.mean(dim=1)
+        max_pool, _ = x_hybrid.max(dim=1)
+        combined = avg_pool + max_pool  # (Batch, 1024)
 
-        if not self._printed:
-            print("[DEBUG] after last_T+ln:", tuple(x.shape))
-            self._printed = True
-
-        feat = x.mean(dim=1)  # (B, D)
-        return self.classifier(feat)
+        return self.classifier(combined).squeeze(-1)
 
 
-# ==========================================
-# 3) Dataset
-# ==========================================
-class ICBHICSVDataset(Dataset):
-    def __init__(self, csv_path, wav_dir, sr=16000, duration=5):
-        print(f"Reading CSV: {csv_path}")
-        self.df = pd.read_csv(csv_path)
-        self.wav_dir = wav_dir
-        self.file_paths = self.df["wav_path"].values
-        self.labels = self.df["label_4class"].values
-        self.sr = sr
-        self.target_length = sr * duration
-
-    def __len__(self):
-        return len(self.file_paths)
-
-    def __getitem__(self, idx):
-        win_path = self.file_paths[idx]
-        file_name = os.path.basename(win_path.replace("\\", "/"))
-        wav_path = os.path.join(self.wav_dir, file_name)
-
-        try:
-            wav, _ = librosa.load(wav_path, sr=self.sr)
-        except Exception:
-            wav = np.zeros(self.target_length, dtype=np.float32)
-
-        if len(wav) > self.target_length:
-            wav = wav[:self.target_length]
-        else:
-            wav = np.pad(wav, (0, self.target_length - len(wav)))
-
-        mel_spec = librosa.feature.melspectrogram(
-            y=wav, sr=self.sr, n_mels=192, n_fft=1024, hop_length=626
-        )
-        log_mel = librosa.power_to_db(mel_spec, ref=np.max)
-        log_mel = (log_mel - log_mel.mean()) / (log_mel.std() + 1e-6)
-
-        x = torch.from_numpy(log_mel).unsqueeze(0).float()  # (1, 192, T)
-        x = x[:, :192, :128]  # (1, 192, 128)
-
-        y = torch.tensor(int(self.labels[idx])).long()
-        return x, y
-
-
-# ==========================================
-# 4) Full Evaluation: Acc / F1 / AUC / Confusion Matrix
-# ==========================================
-@torch.no_grad()
-def evaluate_full(model, loader, device, num_classes=4, save_prefix="val"):
-    model.eval()
-
-    all_probs = []
-    all_preds = []
-    all_labels = []
-
-    for x, y in loader:
-        x = x.to(device, non_blocking=True)
-        y = y.to(device, non_blocking=True)
-
-        logits = model(x)
-        probs = torch.softmax(logits, dim=1)
-
-        all_probs.append(probs.cpu())
-        all_preds.append(torch.argmax(probs, dim=1).cpu())
-        all_labels.append(y.cpu())
-
-    y_true = torch.cat(all_labels).numpy()
-    y_pred = torch.cat(all_preds).numpy()
-    y_prob = torch.cat(all_probs).numpy()
-
-    acc = accuracy_score(y_true, y_pred)
-    f1_macro = f1_score(y_true, y_pred, average="macro")
-    f1_weighted = f1_score(y_true, y_pred, average="weighted")
-
-    # AUC (multi-class OvR)
-    try:
-        auc = roc_auc_score(y_true, y_prob, multi_class="ovr")
-    except Exception:
-        auc = float("nan")
-
-    cm = confusion_matrix(y_true, y_pred)
-
-    # Save confusion matrix figure
-    plt.figure(figsize=(6, 5))
-    sns.heatmap(cm, annot=True, fmt="d", cmap="Blues")
-    plt.xlabel("Predicted")
-    plt.ylabel("True")
-    plt.title(f"{save_prefix} Confusion Matrix")
-    plt.tight_layout()
-    plt.savefig(f"{save_prefix}_confusion_matrix.png")
+# =========================
+# 2) 训练主程序 (保持不变，但需要实例化新的类名)
+# =========================
+def plot_confusion_matrix(cm, epoch, auc):
+    """绘制并保存混淆矩阵图"""
+    plt.figure(figsize=(8, 6))
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
+                xticklabels=['Healthy', 'Abnormal'],
+                yticklabels=['Healthy', 'Abnormal'])
+    plt.xlabel('Predicted Label')
+    plt.ylabel('True Label')
+    plt.title(f'Confusion Matrix (Best AUC: {auc:.4f})')
+    plt.savefig('best_confusion_matrix.png')
     plt.close()
 
-    return {
-        "acc": acc,
-        "f1_macro": f1_macro,
-        "f1_weighted": f1_weighted,
-        "auc": auc,
-        "cm": cm
-    }
 
+def main():
+    DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Using Device: {DEVICE}")
 
-# ==========================================
-# 5) Train
-# ==========================================
-def run_train():
-    CSV_PATH = "/data/dingcong/HeAR/ICBHI_final_database/icbhi_hear_embeddings_4class_meta.csv"
-    WAV_DIR = "/data/dingcong/HeAR/ICBHI_final_database/"
+    # --- 1. 加载数据 ---
+    data_path = "/data/dingcong/HeAR/ICBHI_final_database/icbhi_sequence_embeddings_3D.npz"
+    data = np.load(data_path)
+    X = data["X"]  # (6898, 97, 1024)
+    y = (data["y"] != 0).astype(int)
 
-    batch_size = 4
-    num_workers = 4
-    epochs = 20
-    lr = 5e-5          # 更稳一点
-    val_ratio = 0.1    # 10% 验证集
+    # --- 2. 划分数据集 ---
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print("Device:", device)
+    train_ds = TensorDataset(torch.from_numpy(X_train).float(), torch.from_numpy(y_train).float())
+    test_ds = TensorDataset(torch.from_numpy(X_test).float(), torch.from_numpy(y_test).float())
 
-    dataset = ICBHICSVDataset(CSV_PATH, WAV_DIR)
+    train_loader = DataLoader(train_ds, batch_size=64, shuffle=True)
+    test_loader = DataLoader(test_ds, batch_size=64, shuffle=False)
 
-    n_val = int(len(dataset) * val_ratio)
-    n_train = len(dataset) - n_val
-    train_set, val_set = random_split(dataset, [n_train, n_val])
+    # --- 3. 初始化 BiMamba-Attention Hybrid 模型 ---
+    # **注意：这里实例化的是新的类名 HeARBiMambaHybridClassifier**
+    model = HeARBiMambaHybridClassifier(input_dim=1024, num_heads=8, dropout_rate=0.4).to(DEVICE)
 
-    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True,
-                              num_workers=num_workers, pin_memory=True)
-    val_loader = DataLoader(val_set, batch_size=batch_size, shuffle=False,
-                            num_workers=num_workers, pin_memory=True)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-2)
+    criterion = nn.BCEWithLogitsLoss()
 
-    model = HeARTMTHybridModel(num_classes=4).to(device)
+    best_auc = 0
+    best_cm = None
 
-    # Freeze: only train middle_M + classifier
-    trainable_params = []
-    print("\n--- Parameter freeze check ---")
-    for name, p in model.named_parameters():
-        if ("middle_M" in name) or ("classifier" in name):
-            p.requires_grad = True
-            trainable_params.append(p)
-        else:
-            p.requires_grad = False
-    print(f"Trainable param tensors: {len(trainable_params)}")
+    print(f"\nBiMamba-Attention Hybrid 训练启动... 样本量: {len(X_train)}")
+    print(f"{'Epoch':<6} | {'Loss':<8} | {'AUC':<8} | {'F1':<8} | {'Sens':<8} | {'Spec':<8}")
+    print("-" * 60)
 
-    optimizer = optim.AdamW(trainable_params, lr=lr)
-    criterion = nn.CrossEntropyLoss()
-
-    # Sanity forward
-    model.train()
-    x0, y0 = next(iter(train_loader))
-    x0 = x0.to(device)
-    with torch.no_grad():
-        out0 = model(x0)
-    print("Sanity forward OK:", tuple(out0.shape))
-
-    best_f1 = -1.0
-
-    print("\n>>> Start training...")
-    for epoch in range(epochs):
+    for epoch in range(1, 51):
         model.train()
-        epoch_loss = 0.0
-
-        for i, (x, y) in enumerate(train_loader):
-            x = x.to(device, non_blocking=True)
-            y = y.to(device, non_blocking=True)
-
-            optimizer.zero_grad(set_to_none=True)
-            logits = model(x)
-            loss = criterion(logits, y)
+        train_loss = 0
+        for xb, yb in train_loader:
+            optimizer.zero_grad()
+            out = model(xb.to(DEVICE))
+            loss = criterion(out, yb.to(DEVICE))
             loss.backward()
             optimizer.step()
+            train_loss += loss.item()
 
-            epoch_loss += float(loss.item())
-            if i % 50 == 0:
-                print(f"Epoch {epoch+1}/{epochs} | Step {i}/{len(train_loader)} | Loss {loss.item():.4f}")
+        # --- 4. 评估 ---
+        model.eval()
+        all_probs = []
+        all_targets = []
+        with torch.no_grad():
+            for xb, yb in test_loader:
+                out = model(xb.to(DEVICE))
+                all_probs.append(torch.sigmoid(out).cpu().numpy())
+                all_targets.append(yb.numpy())
 
-        train_loss = epoch_loss / max(len(train_loader), 1)
+        y_prob = np.concatenate(all_probs)
+        y_true = np.concatenate(all_targets)
+        y_pred = (y_prob > 0.5).astype(int)
 
-        metrics = evaluate_full(model, val_loader, device, num_classes=4, save_prefix=f"val_ep{epoch+1}")
+        # 计算详细指标
+        auc = roc_auc_score(y_true, y_prob)
+        f1 = f1_score(y_true, y_pred)
+        cm = confusion_matrix(y_true, y_pred)
+        tn, fp, fn, tp = cm.ravel()
+        sens = tp / (tp + fn) if (tp + fn) > 0 else 0
+        spec = tn / (tn + fp) if (tn + fp) > 0 else 0
 
         print(
-            f"--- Epoch {epoch+1} done | "
-            f"TrainLoss={train_loss:.4f} | "
-            f"ValAcc={metrics['acc']:.4f} | "
-            f"ValF1-macro={metrics['f1_macro']:.4f} | "
-            f"ValF1-weighted={metrics['f1_weighted']:.4f} | "
-            f"ValAUC={metrics['auc']:.4f} | "
-            f"CM saved: val_ep{epoch+1}_confusion_matrix.png ---"
-        )
+            f"{epoch:<6} | {train_loss / len(train_loader):<8.4f} | {auc:<8.4f} | {f1:<8.4f} | {sens:<8.4f} | {spec:<8.4f}")
 
-        # Save best by macro-F1 (recommended for imbalance)
-        if metrics["f1_macro"] > best_f1:
-            best_f1 = metrics["f1_macro"]
-            torch.save(model.state_dict(), "best_hear_tmt_icbhi.pth")
-            print(f"✅ Saved BEST model (macro-F1={best_f1:.4f}) -> best_hear_tmt_icbhi.pth")
+        # --- 5. 保存最优模型及混淆矩阵 ---
+        if auc > best_auc:
+            best_auc = auc
+            best_cm = cm
+            torch.save(model.state_dict(), "best_hearbimambahybrid.pt")  # 文件名更改
+            # 实时更新混淆矩阵图
+            plot_confusion_matrix(best_cm, epoch, best_auc)
 
-    torch.save(model.state_dict(), "final_hear_tmt_icbhi.pth")
-    print("Saved final: final_hear_tmt_icbhi.pth")
-    print("Best macro-F1:", best_f1)
+    print(f"\n训练结束！最高 AUC: {best_auc:.4f}")
+    print("最优混淆矩阵已保存至: best_confusion_matrix.png")
 
 
 if __name__ == "__main__":
-    run_train()
+    main()
