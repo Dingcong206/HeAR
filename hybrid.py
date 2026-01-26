@@ -50,18 +50,23 @@ class HeARTMTHybrid(nn.Module):
     def __init__(self, model_id="google/hear-pytorch", mamba_layers=4):
         super().__init__()
 
-        # A. 加载原始配置和模型 (确保不自动添加 pooling)
         config = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
-        self.base = AutoModel.from_pretrained(model_id, config=config, trust_remote_code=True, add_pooling_layer=False)
+        # 获取维度 (HeAR 是 ViT-L，所以这里通常是 1024)
+        d_model = config.hidden_size
 
-        d_model = config.hidden_size  # 1024
+        self.base = AutoModel.from_pretrained(
+            model_id,
+            config=config,
+            trust_remote_code=True,
+            add_pooling_layer=False
+        )
 
-        # B. 拆解原有 Transformer 层 (TMT: 8-M-8)
+        # B. 拆解层
         self.embeddings = self.base.embeddings
         self.first_T = nn.ModuleList(self.base.encoder.layer[:8])
         self.last_T = nn.ModuleList(self.base.encoder.layer[-8:])
 
-        # C. 插入自定义的 Mamba 层 (M)
+        # C. 插入 Mamba 层 (现在 d_model 已经定义过了)
         self.middle_M = nn.ModuleList([
             BiMambaBlock(d_model=d_model) for _ in range(mamba_layers)
         ])
@@ -69,24 +74,38 @@ class HeARTMTHybrid(nn.Module):
         self.layernorm = self.base.layernorm
 
     def forward(self, pixel_values):
-        # 1. Embedding 层 -> (Batch, 97, 1024)
+        # 1. Embedding 层
         x = self.embeddings(pixel_values)
+        # 此时 x 应该是 (Batch, 97, 1024)
 
         # 2. 第一段 Transformer (T)
         for blk in self.first_T:
-            x = blk(x)[0]  # ViTLayer 返回 tuple，取第一个元素
+            # 必须显式取 [0]，因为 ViTLayer 返回 (hidden_states, attention_probs)
+            x = blk(x)[0]
+
+            # === 【关键修复位置】 ===
+        # 调试用：print(f"DEBUG: Shape before Mamba: {x.shape}")
+
+        # 有些 ViT 实现会在序列第一个位置放 CLS token，
+        # 如果你发现维度变成了 2 维，说明 blk(x)[0] 的实现可能触发了 pooler
+        # 我们在这里确保 x 依然是 3 维
+        if x.dim() == 2:
+            # 如果不幸变成了 2 维，通常是因为取到了 CLS 向量
+            # 我们需要检查 self.base 的配置，确保 add_pooling_layer=False
+            raise ValueError(f"维度坍塌！得到了 {x.shape}。请检查是否触发了 Pooling。")
 
         # 3. 中间段 BiMamba (M)
         for mamba_blk in self.middle_M:
+            # Mamba 层严格要求 (Batch, Seq_len, Dim)
             x = mamba_blk(x)
 
         # 4. 最后一段 Transformer (T)
         for blk in self.last_T:
             x = blk(x)[0]
 
-        # 5. 输出层归一化
+        # 5. 输出
         x = self.layernorm(x)
-        return x  # (Batch, 97, 1024)
+        return x
 
 
 # =========================
