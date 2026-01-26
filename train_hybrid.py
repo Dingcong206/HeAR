@@ -22,11 +22,33 @@ class BiMambaBlock(nn.Module):
         self.dropout = nn.Dropout(0.1)
 
     def forward(self, x):
-        res = x
-        x = self.norm(x)
-        out_fwd = self.mamba_fwd(x)
-        out_bwd = self.mamba_bwd(x.flip(dims=[1])).flip(dims=[1])
-        return res + self.dropout(out_fwd + out_bwd)
+        # x: (B, 1, 192, 128)
+        x = self.embeddings(x)  # (B, 97, 1024)
+
+        for blk in self.first_T:
+            x = blk(x)[0]
+
+        # --- 关键修复：确保维度始终是 3 维 (Batch, Seq, Dim) ---
+        if x.dim() == 2:  # 比如变成了 (97, 1024)
+            x = x.unsqueeze(0)
+
+        for m_blk in self.middle_M:
+            x = m_blk(x)
+
+        for blk in self.last_T:
+            x = blk(x)[0]
+
+        x = self.layernorm(x)
+
+        # --- 健壮的平均池化 ---
+        # 无论维度如何，我们只在倒数第二个维度（时间维 97）做平均
+        if x.dim() == 3:
+            global_feat = x.mean(dim=1)  # 得到 (B, 1024)
+        else:
+            # 最后的防线：如果还是乱了，强制转回
+            global_feat = x.view(-1, 1024)
+
+        return self.classifier(global_feat)
 
 
 class HeARTMTHybridModel(nn.Module):
