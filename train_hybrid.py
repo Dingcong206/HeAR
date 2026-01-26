@@ -22,34 +22,12 @@ class BiMambaBlock(nn.Module):
         self.dropout = nn.Dropout(0.1)
 
     def forward(self, x):
-        # x: (B, 1, 192, 128)
-        x = self.embeddings(x)  # (B, 97, 1024)
-
-        for blk in self.first_T:
-            x = blk(x)[0]
-
-        # --- 关键修复：确保维度始终是 3 维 (Batch, Seq, Dim) ---
-        if x.dim() == 2:  # 比如变成了 (97, 1024)
-            x = x.unsqueeze(0)
-
-        for m_blk in self.middle_M:
-            x = m_blk(x)
-
-        for blk in self.last_T:
-            x = blk(x)[0]
-
-        x = self.layernorm(x)
-
-        # --- 健壮的平均池化 ---
-        # 无论维度如何，我们只在倒数第二个维度（时间维 97）做平均
-        if x.dim() == 3:
-            global_feat = x.mean(dim=1)  # 得到 (B, 1024)
-        else:
-            # 最后的防线：如果还是乱了，强制转回
-            global_feat = x.view(-1, 1024)
-
-        return self.classifier(global_feat)
-
+        res = x
+        x = self.norm(x)
+        out_fwd = self.mamba_fwd(x)
+        # 序列翻转实现双向建模
+        out_bwd = self.mamba_bwd(x.flip(dims=[1])).flip(dims=[1])
+        return res + self.dropout(out_fwd + out_bwd)
 
 class HeARTMTHybridModel(nn.Module):
     def __init__(self, model_id="google/hear-pytorch", num_classes=4):
@@ -71,13 +49,31 @@ class HeARTMTHybridModel(nn.Module):
             nn.Linear(512, num_classes)
         )
 
+
+class HeARTMTHybridModel(nn.Module):
+    # ... __init__ 保持不变 ...
     def forward(self, x):
+        # 1. 基础特征提取 (B, 1, 192, 128) -> (B, 97, 1024)
         x = self.embeddings(x)
-        for blk in self.first_T: x = blk(x)[0]
+
+        # 2. 前 8 层 Transformer
+        for blk in self.first_T:
+            x = blk(x)[0]
+
+        # 确保维度是 (Batch, Seq, Dim)
         if x.dim() == 2: x = x.unsqueeze(0)
-        for m_blk in self.middle_M: x = m_blk(x)
-        for blk in self.last_T: x = blk(x)[0]
+
+        # 3. 中间 4 层 BiMamba (此处会调用上面的 BiMambaBlock.forward)
+        for m_blk in self.middle_M:
+            x = m_blk(x)
+
+        # 4. 后 8 层 Transformer
+        for blk in self.last_T:
+            x = blk(x)[0]
+
         x = self.layernorm(x)
+
+        # 5. 聚合池化
         global_feat = x.mean(dim=1)
         return self.classifier(global_feat)
 
