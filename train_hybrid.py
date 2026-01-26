@@ -6,7 +6,7 @@ import librosa
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, random_split
 
 from mamba_ssm import Mamba
 from transformers import AutoModel, AutoConfig
@@ -24,11 +24,11 @@ class BiMambaBlock(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
-        # x must be (B, L, D)
+        # Ensure (B, L, D)
         if x.dim() == 2:
-            x = x.unsqueeze(1)  # (B, 1, D)
+            x = x.unsqueeze(1)
         if x.dim() != 3:
-            raise RuntimeError(f"BiMambaBlock expects 3D (B,L,D), got {x.shape}")
+            raise RuntimeError(f"BiMambaBlock expects 3D (B,L,D), got {tuple(x.shape)}")
 
         res = x
         x = self.norm(x)
@@ -42,7 +42,8 @@ class BiMambaBlock(nn.Module):
 # ==========================================
 class HeARTMTHybridModel(nn.Module):
     def __init__(self, model_id="google/hear-pytorch", num_classes=4,
-                 n_first=8, n_last=8, n_mamba=4):
+                 n_first=8, n_last=8, n_mamba=4,
+                 d_state=16, d_conv=4, expand=2):
         super().__init__()
 
         config = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
@@ -53,15 +54,16 @@ class HeARTMTHybridModel(nn.Module):
             add_pooling_layer=False
         )
 
-        # infer d_model
         d_model = getattr(config, "hidden_size", None) or getattr(config, "d_model", None)
         if d_model is None:
-            raise RuntimeError("Cannot infer hidden size from config.")
+            raise RuntimeError("Cannot infer hidden size from config (hidden_size/d_model).")
 
-        # modules
         self.embeddings = self.base.embeddings
         self.first_T = nn.ModuleList(self.base.encoder.layer[:n_first])
-        self.middle_M = nn.ModuleList([BiMambaBlock(d_model=d_model) for _ in range(n_mamba)])
+        self.middle_M = nn.ModuleList([
+            BiMambaBlock(d_model=d_model, d_state=d_state, d_conv=d_conv, expand=expand)
+            for _ in range(n_mamba)
+        ])
         self.last_T = nn.ModuleList(self.base.encoder.layer[-n_last:])
         self.layernorm = self.base.layernorm
 
@@ -72,43 +74,35 @@ class HeARTMTHybridModel(nn.Module):
             nn.Linear(512, num_classes)
         )
 
-        self._printed = False  # only print shapes once
+        self._printed = False  # debug prints once
 
     @staticmethod
     def _ensure_3d_tokens(x: torch.Tensor) -> torch.Tensor:
         """
         Ensure x is (B, L, D).
-        - (B, D)   -> (B, 1, D)
-        - (B, D, H, W) -> (B, H*W, D)
-        - (B, D, L) -> (B, L, D)
-        - (B, L, D) -> keep
+        - (B, D)        -> (B, 1, D)
+        - (B, D, H, W)  -> (B, H*W, D)
+        - (B, D, L)     -> (B, L, D)
+        - (B, L, D)     -> keep
         """
         if x.dim() == 2:
             return x.unsqueeze(1).contiguous()
 
         if x.dim() == 4:
-            # (B, D, H, W) -> (B, L, D)
             return x.flatten(2).transpose(1, 2).contiguous()
 
         if x.dim() == 3:
-            # If it's (B, D, L) transpose to (B, L, D)
             B, A, C = x.shape
-            # heuristic: hidden size is usually larger than token length
+            # heuristic transpose if looks like (B, D, L)
             if A >= 256 and C < A:
                 return x.transpose(1, 2).contiguous()
             return x.contiguous()
 
-        raise RuntimeError(f"Unexpected tensor shape: {x.shape}")
+        raise RuntimeError(f"Unexpected tensor shape: {tuple(x.shape)}")
 
     @staticmethod
     def _unwrap_block_output(out):
-        """
-        HF blocks may return:
-          - tuple: (hidden_states, ...)
-          - dict-like
-          - tensor directly
-        We always extract hidden_states.
-        """
+        # HF blocks often return tuple (hidden_states, ...)
         if isinstance(out, tuple):
             return out[0]
         if isinstance(out, dict) and "last_hidden_state" in out:
@@ -116,40 +110,33 @@ class HeARTMTHybridModel(nn.Module):
         return out
 
     def forward(self, x):
-        # x: (B, 1, 192, 128)
-
         x = self.embeddings(x)
         x = self._ensure_3d_tokens(x)
 
-        if (not self._printed) and torch.is_tensor(x):
+        if not self._printed:
             print("[DEBUG] after embeddings:", tuple(x.shape))
 
-        # first transformer
         for blk in self.first_T:
-            out = blk(x)
-            x = self._unwrap_block_output(out)
+            x = self._unwrap_block_output(blk(x))
             x = self._ensure_3d_tokens(x)
 
-        if (not self._printed) and torch.is_tensor(x):
+        if not self._printed:
             print("[DEBUG] after first_T:", tuple(x.shape))
 
-        # mamba
         for m_blk in self.middle_M:
             x = self._ensure_3d_tokens(x)
             x = m_blk(x)
 
-        if (not self._printed) and torch.is_tensor(x):
+        if not self._printed:
             print("[DEBUG] after middle_M:", tuple(x.shape))
 
-        # last transformer
         for blk in self.last_T:
-            out = blk(x)
-            x = self._unwrap_block_output(out)
+            x = self._unwrap_block_output(blk(x))
             x = self._ensure_3d_tokens(x)
 
         x = self.layernorm(x)
 
-        if (not self._printed) and torch.is_tensor(x):
+        if not self._printed:
             print("[DEBUG] after last_T+ln:", tuple(x.shape))
             self._printed = True
 
@@ -202,7 +189,32 @@ class ICBHICSVDataset(Dataset):
 
 
 # ==========================================
-# 4) Train
+# 4) Eval
+# ==========================================
+@torch.no_grad()
+def evaluate(model, loader, device):
+    model.eval()
+    crit = nn.CrossEntropyLoss()
+    total, correct = 0, 0
+    loss_sum = 0.0
+
+    for x, y in loader:
+        x = x.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True)
+
+        logits = model(x)
+        loss = crit(logits, y)
+
+        loss_sum += float(loss.item()) * x.size(0)
+        pred = logits.argmax(dim=1)
+        correct += int((pred == y).sum().item())
+        total += int(y.size(0))
+
+    return loss_sum / max(total, 1), correct / max(total, 1)
+
+
+# ==========================================
+# 5) Train
 # ==========================================
 def run_train():
     CSV_PATH = "/data/dingcong/HeAR/ICBHI_final_database/icbhi_hear_embeddings_4class_meta.csv"
@@ -211,16 +223,24 @@ def run_train():
     batch_size = 4
     num_workers = 4
     epochs = 20
-    lr = 1e-4
+    lr = 5e-5          # 更稳一点
+    val_ratio = 0.1    # 10% 做验证
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print("Device:", device)
 
     dataset = ICBHICSVDataset(CSV_PATH, WAV_DIR)
-    train_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True,
-                              num_workers=num_workers, pin_memory=True)
 
-    model = HeARTMTHybridModel().to(device)
+    n_val = int(len(dataset) * val_ratio)
+    n_train = len(dataset) - n_val
+    train_set, val_set = random_split(dataset, [n_train, n_val])
+
+    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True,
+                              num_workers=num_workers, pin_memory=True)
+    val_loader = DataLoader(val_set, batch_size=batch_size, shuffle=False,
+                            num_workers=num_workers, pin_memory=True)
+
+    model = HeARTMTHybridModel(num_classes=4).to(device)
 
     # freeze: only middle_M + classifier
     trainable_params = []
@@ -244,6 +264,8 @@ def run_train():
         out0 = model(x0)
     print("Sanity forward OK:", tuple(out0.shape))
 
+    best_acc = 0.0
+
     print("\n>>> Start training...")
     for epoch in range(epochs):
         model.train()
@@ -263,11 +285,19 @@ def run_train():
             if i % 50 == 0:
                 print(f"Epoch {epoch+1}/{epochs} | Step {i}/{len(train_loader)} | Loss {loss.item():.4f}")
 
-        print(f"--- Epoch {epoch+1} done | Avg Loss: {epoch_loss/len(train_loader):.4f} ---")
+        train_avg = epoch_loss / max(len(train_loader), 1)
+        val_loss, val_acc = evaluate(model, val_loader, device)
 
-    save_path = "final_hear_tmt_icbhi.pth"
-    torch.save(model.state_dict(), save_path)
-    print("Saved:", save_path)
+        print(f"--- Epoch {epoch+1} done | TrainLoss {train_avg:.4f} | ValLoss {val_loss:.4f} | ValAcc {val_acc:.4f} ---")
+
+        if val_acc > best_acc:
+            best_acc = val_acc
+            torch.save(model.state_dict(), "best_hear_tmt_icbhi.pth")
+            print(f"✅ Saved best checkpoint: best_hear_tmt_icbhi.pth (ValAcc={best_acc:.4f})")
+
+    torch.save(model.state_dict(), "final_hear_tmt_icbhi.pth")
+    print("Saved final: final_hear_tmt_icbhi.pth")
+    print("Best ValAcc:", best_acc)
 
 
 if __name__ == "__main__":
