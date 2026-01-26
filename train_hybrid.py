@@ -11,7 +11,7 @@ from transformers import AutoModel, AutoConfig
 
 
 # ==========================================
-# 1. 架构定义 (HeAR-TMT Hybrid)
+# 1. 基础 Mamba 块定义 (仅负责序列建模)
 # ==========================================
 class BiMambaBlock(nn.Module):
     def __init__(self, d_model, d_state=16, d_conv=4, expand=2):
@@ -25,23 +25,31 @@ class BiMambaBlock(nn.Module):
         res = x
         x = self.norm(x)
         out_fwd = self.mamba_fwd(x)
-        # 序列翻转实现双向建模
         out_bwd = self.mamba_bwd(x.flip(dims=[1])).flip(dims=[1])
         return res + self.dropout(out_fwd + out_bwd)
 
+
+# ==========================================
+# 2. HeAR-TMT 混合模型完整定义
+# ==========================================
 class HeARTMTHybridModel(nn.Module):
     def __init__(self, model_id="google/hear-pytorch", num_classes=4):
         super().__init__()
+        # 加载 HeAR 配置与模型
         config = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
         d_model = config.hidden_size  # 1024
 
+        # 加载原生 Backbone
         self.base = AutoModel.from_pretrained(model_id, config=config, trust_remote_code=True, add_pooling_layer=False)
+
+        # 提取组件
         self.embeddings = self.base.embeddings
-        self.first_T = nn.ModuleList(self.base.encoder.layer[:8])
-        self.middle_M = nn.ModuleList([BiMambaBlock(d_model=d_model) for _ in range(4)])
-        self.last_T = nn.ModuleList(self.base.encoder.layer[-8:])
+        self.first_T = nn.ModuleList(self.base.encoder.layer[:8])  # 前8层 Transformer
+        self.middle_M = nn.ModuleList([BiMambaBlock(d_model=d_model) for _ in range(4)])  # 4层 Mamba
+        self.last_T = nn.ModuleList(self.base.encoder.layer[-8:])  # 后8层 Transformer
         self.layernorm = self.base.layernorm
 
+        # 分类器
         self.classifier = nn.Sequential(
             nn.Linear(d_model, 512),
             nn.ReLU(),
@@ -49,21 +57,18 @@ class HeARTMTHybridModel(nn.Module):
             nn.Linear(512, num_classes)
         )
 
-
-class HeARTMTHybridModel(nn.Module):
-    # ... __init__ 保持不变 ...
     def forward(self, x):
-        # 1. 基础特征提取 (B, 1, 192, 128) -> (B, 97, 1024)
+        # 1. 输入: (Batch, 1, 192, 128) -> (Batch, 97, 1024)
         x = self.embeddings(x)
 
         # 2. 前 8 层 Transformer
         for blk in self.first_T:
             x = blk(x)[0]
 
-        # 确保维度是 (Batch, Seq, Dim)
+        # 维度对齐检查 (确保始终是 3D Tensor)
         if x.dim() == 2: x = x.unsqueeze(0)
 
-        # 3. 中间 4 层 BiMamba (此处会调用上面的 BiMambaBlock.forward)
+        # 3. 中间 4 层 BiMamba
         for m_blk in self.middle_M:
             x = m_blk(x)
 
@@ -73,13 +78,15 @@ class HeARTMTHybridModel(nn.Module):
 
         x = self.layernorm(x)
 
-        # 5. 聚合池化
+        # 5. 聚合池化 (在时间维度 97 上求平均)
+        # x shape: (Batch, 97, 1024) -> global_feat shape: (Batch, 1024)
         global_feat = x.mean(dim=1)
+
         return self.classifier(global_feat)
 
 
 # ==========================================
-# 2. ICBHI Dataset (包含路径自动修复)
+# 3. ICBHI Dataset 处理逻辑
 # ==========================================
 class ICBHICSVDataset(Dataset):
     def __init__(self, csv_path, wav_dir, sr=16000, duration=5):
@@ -95,15 +102,14 @@ class ICBHICSVDataset(Dataset):
         return len(self.file_paths)
 
     def __getitem__(self, idx):
-        # 将 Windows 路径转换为文件名，并拼接 Linux 本地目录
+        # 路径修复: Windows -> Linux
         win_path = self.file_paths[idx]
         file_name = os.path.basename(win_path.replace('\\', '/'))
         wav_path = os.path.join(self.wav_dir, file_name)
 
         try:
             wav, _ = librosa.load(wav_path, sr=self.sr)
-        except Exception as e:
-            # 如果找不到文件，打印警告并返回静音
+        except:
             wav = np.zeros(self.target_length)
 
         if len(wav) > self.target_length:
@@ -111,7 +117,7 @@ class ICBHICSVDataset(Dataset):
         else:
             wav = np.pad(wav, (0, self.target_length - len(wav)))
 
-        # 生成 192x128 频谱
+        # 生成频谱 192x128
         mel_spec = librosa.feature.melspectrogram(y=wav, sr=self.sr, n_mels=192, n_fft=1024, hop_length=626)
         log_mel = librosa.power_to_db(mel_spec, ref=np.max)
         log_mel = (log_mel - log_mel.mean()) / (log_mel.std() + 1e-6)
@@ -121,40 +127,43 @@ class ICBHICSVDataset(Dataset):
 
 
 # ==========================================
-# 3. 运行脚本
+# 4. 训练主循环
 # ==========================================
 def run_train():
-    # --- 修正后的绝对路径 ---
     CSV_PATH = "/data/dingcong/HeAR/ICBHI_final_database/icbhi_hear_embeddings_4class_meta.csv"
     WAV_DIR = "/data/dingcong/HeAR/ICBHI_final_database/"
 
-    if not os.path.exists(CSV_PATH):
-        raise FileNotFoundError(f"找不到 CSV 文件: {CSV_PATH}")
-
-    # 初始化数据和加载器
     dataset = ICBHICSVDataset(CSV_PATH, WAV_DIR)
+    # 显存较小建议 batch_size=2
     train_loader = DataLoader(dataset, batch_size=2, shuffle=True, num_workers=4)
 
-    # 初始化模型并移至 GPU
     model = HeARTMTHybridModel().cuda()
 
-    # 第一阶段策略：冻结除 Mamba 和 Classifier 以外的层
+    # --- 修复优化器列表为空的策略 ---
+    trainable_params = []
+    print("\n--- 参数冻结状态分析 ---")
     for name, param in model.named_parameters():
         if "middle_M" in name or "classifier" in name:
             param.requires_grad = True
+            trainable_params.append(param)
+            # print(f"[训练] {name}") # 调试时可开启
         else:
             param.requires_grad = False
 
-    optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=1e-4)
+    print(f"可训练参数组数量: {len(trainable_params)}")
+
+    if len(trainable_params) == 0:
+        raise ValueError("致命错误: 没找到可训练参数，请检查命名！")
+
+    optimizer = optim.AdamW(trainable_params, lr=1e-4)
     criterion = nn.CrossEntropyLoss()
 
-    print(f">>> 数据准备就绪，样本数: {len(dataset)}")
-    print(">>> 开始训练...")
+    print("\n>>> 数据就绪，开始训练...")
 
     for epoch in range(20):
         model.train()
-        total_loss = 0
-        for images, labels in train_loader:
+        epoch_loss = 0
+        for i, (images, labels) in enumerate(train_loader):
             images, labels = images.cuda(), labels.cuda()
 
             optimizer.zero_grad()
@@ -162,12 +171,15 @@ def run_train():
             loss = criterion(outputs, labels)
             loss.backward()
             optimizer.step()
-            total_loss += loss.item()
 
-        print(f"Epoch {epoch + 1}/20 | Loss: {total_loss / len(train_loader):.4f}")
+            epoch_loss += loss.item()
+            if i % 50 == 0:
+                print(f"Epoch {epoch + 1} | Batch {i} | Loss: {loss.item():.4f}")
+
+        print(f"--- Epoch {epoch + 1} 结束 | 平均 Loss: {epoch_loss / len(train_loader):.4f} ---")
 
     torch.save(model.state_dict(), "final_hear_tmt_icbhi.pth")
-    print("训练成功结束，权重已保存为 final_hear_tmt_icbhi.pth")
+    print("训练保存成功！")
 
 
 if __name__ == "__main__":
